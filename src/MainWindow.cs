@@ -25,24 +25,24 @@ namespace MaintOps;
 /// pwsh -Run execution streamed back live.</summary>
 public sealed class MainWindow : Window
 {
-    internal const string Version = "1.0.0";
+    internal const string Version = "1.1.0";
 
     private static SolidColorBrush F(Color c) { var b = new SolidColorBrush(c); b.Freeze(); return b; }
-    private static readonly Brush Bg    = F(Color.FromRgb(0x14, 0x18, 0x1D));
-    private static readonly Brush Panel = F(Color.FromRgb(0x1A, 0x1F, 0x26));
-    private static readonly Brush Line  = F(Color.FromRgb(0x33, 0x3D, 0x4A));
-    private static readonly Brush Fg    = F(Color.FromRgb(0xD8, 0xDE, 0xE9));
-    private static readonly Brush FgDim = F(Color.FromRgb(0x8A, 0x94, 0xA3));
-    private static readonly Brush Ok    = F(Color.FromRgb(0x6E, 0xC4, 0x76));
-    private static readonly Brush Bad   = F(Color.FromRgb(0xE0, 0x5C, 0x6E));
-    private static readonly Brush Warn  = F(Color.FromRgb(0xE8, 0xA0, 0x4E));
-    private static readonly Brush Accent= F(Color.FromRgb(0x5C, 0xC8, 0xE8));
-    private static readonly Brush BtnBg = F(Color.FromRgb(0x2A, 0x32, 0x3E));
-    private static readonly Brush BarGray   = F(Color.FromRgb(0x5A, 0x64, 0x70));
-    private static readonly Brush BarYellow = F(Color.FromRgb(0xE5, 0xC8, 0x4B));
-    private static readonly Brush BarOrange = F(Color.FromRgb(0xE8, 0xA0, 0x4E));
-    private static readonly Brush BarGreen  = F(Color.FromRgb(0x6E, 0xC4, 0x76));
-    private static readonly Brush BarRed    = F(Color.FromRgb(0xE0, 0x5C, 0x6E));
+    internal static readonly Brush Bg    = F(Color.FromRgb(0x14, 0x18, 0x1D));
+    internal static readonly Brush Panel = F(Color.FromRgb(0x1A, 0x1F, 0x26));
+    internal static readonly Brush Line  = F(Color.FromRgb(0x33, 0x3D, 0x4A));
+    internal static readonly Brush Fg    = F(Color.FromRgb(0xD8, 0xDE, 0xE9));
+    internal static readonly Brush FgDim = F(Color.FromRgb(0x8A, 0x94, 0xA3));
+    internal static readonly Brush Ok    = F(Color.FromRgb(0x6E, 0xC4, 0x76));
+    internal static readonly Brush Bad   = F(Color.FromRgb(0xE0, 0x5C, 0x6E));
+    internal static readonly Brush Warn  = F(Color.FromRgb(0xE8, 0xA0, 0x4E));
+    internal static readonly Brush Accent= F(Color.FromRgb(0x5C, 0xC8, 0xE8));
+    internal static readonly Brush BtnBg = F(Color.FromRgb(0x2A, 0x32, 0x3E));
+    internal static readonly Brush BarGray   = F(Color.FromRgb(0x5A, 0x64, 0x70));
+    internal static readonly Brush BarYellow = F(Color.FromRgb(0xE5, 0xC8, 0x4B));
+    internal static readonly Brush BarOrange = F(Color.FromRgb(0xE8, 0xA0, 0x4E));
+    internal static readonly Brush BarGreen  = F(Color.FromRgb(0x6E, 0xC4, 0x76));
+    internal static readonly Brush BarRed    = F(Color.FromRgb(0xE0, 0x5C, 0x6E));
 
     private const string UiFont   = "Microsoft YaHei UI";
     private const string MonoFont = "Cascadia Mono, Consolas, Microsoft YaHei UI";
@@ -50,6 +50,13 @@ public sealed class MainWindow : Window
     private readonly Config _cfg;
     private readonly TerminalView _term;
     private readonly TreeView _tree = new();
+    // 261120 开工装配 desk: the LEFT COLUMN alone flips between the assembly panel (default
+    // tab) and the menu tree; terminal echo, lights and progress bar stay shared (master).
+    private BlocksPanel _blocks = null!;
+    private ScrollViewer _blocksView = null!;
+    private Border _treeWrap = null!;
+    private Button _tabAsm = null!, _tabTree = null!;
+    private bool _tabOnAsm = true;
     private readonly RunStateLight _state = new();
     private readonly TextBlock _runningInfo = new()
     {
@@ -120,14 +127,33 @@ public sealed class MainWindow : Window
         DockPanel.SetDock(bottom, Dock.Bottom);
         root.Children.Add(bottom);
 
+        _blocks = new BlocksPanel(this);
+        _treeWrap = new Border { Child = _tree, Background = Panel };
+        _blocksView = new ScrollViewer
+        {
+            Content = _blocks.Root,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            Background = Panel, Padding = new Thickness(2, 2, 2, 4),
+            Visibility = Visibility.Collapsed,
+        };
+        var leftHost = new Grid();
+        leftHost.Children.Add(_treeWrap);
+        leftHost.Children.Add(_blocksView);
+        var leftDock = new DockPanel();
+        var tabStrip = BuildTabStrip();
+        DockPanel.SetDock(tabStrip, Dock.Top);
+        leftDock.Children.Add(tabStrip);
+        leftDock.Children.Add(leftHost);
         var treeBox = new Border
         {
-            Width = 330, Background = Panel,
+            Width = 340, Background = Panel,
             BorderBrush = Line, BorderThickness = new Thickness(0, 0, 1, 0),
-            Child = _tree,
+            Child = leftDock,
         };
         DockPanel.SetDock(treeBox, Dock.Left);
         root.Children.Add(treeBox);
+        SetTab(true);   // assembly desk opens first (master's call 261120)
 
         root.Children.Add(_term.Control);   // fills the rest
         Content = root;
@@ -158,6 +184,50 @@ public sealed class MainWindow : Window
     private readonly DispatcherTimer _uiTimer     = new() { Interval = TimeSpan.FromSeconds(1) };
 
     // ================= UI build =================
+
+    private UIElement BuildTabStrip()
+    {
+        var sp = new StackPanel { Orientation = Orientation.Horizontal, Background = Panel };
+        _tabAsm = MkTab("▶ 开工装配");
+        _tabAsm.Click += (_, _) => SetTab(true);
+        _tabTree = MkTab("≡ 菜单树");
+        _tabTree.Click += (_, _) => SetTab(false);
+        sp.Children.Add(_tabAsm);
+        sp.Children.Add(_tabTree);
+        return new Border { Child = sp, Background = Panel, BorderBrush = Line, BorderThickness = new Thickness(0, 0, 0, 1) };
+    }
+
+    private Button MkTab(string t) => new()
+    {
+        Content = t, FontSize = 12.5, Margin = new Thickness(4, 4, 2, 0),
+        Padding = new Thickness(10, 4, 10, 4), Background = BtnBg, Foreground = FgDim,
+        BorderBrush = Line,
+    };
+
+    private void SetTab(bool asm)
+    {
+        if (_blocks == null) return;
+        _tabOnAsm = asm;
+        _treeWrap.Visibility = asm ? Visibility.Collapsed : Visibility.Visible;
+        _blocksView.Visibility = asm ? Visibility.Visible : Visibility.Collapsed;
+        _tabAsm.Background = asm ? BtnBg : Panel;  _tabAsm.Foreground = asm ? Accent : FgDim;
+        _tabTree.Background = !asm ? BtnBg : Panel; _tabTree.Foreground = !asm ? Accent : FgDim;
+        if (asm) _blocks.ForceProbe();   // back to the desk: fresh truth ASAP
+    }
+
+    /// <summary>Entry point of the 开工装配 button. Strong-confirm the full plan, then run the
+    /// single-shot b>1 through the very same kernel the menu tree uses.</summary>
+    public async Task RunAssemblyAsync(string spec, string label, string planBody)
+    {
+        if (_criticalRun != null)
+        {
+            _term.AppendNote($"操作「{_criticalRun}」正在执行，请等它结束（或点「停止当前」）", true);
+            return;
+        }
+        var body = planBody + "\n\n将以单发 pwsh 进程运行，输出实时回显在右侧。";
+        if (!Dialogs.Confirm(this, "开工装配 · 一键装配", body, true)) return;
+        await LaunchCoreAsync("b>1", label, spec, true);
+    }
 
     private UIElement BuildTopBar()
     {
@@ -727,14 +797,21 @@ public sealed class MainWindow : Window
             if (!Dialogs.Confirm(this, title, body.ToString(), entry.R == "danger")) return;
         }
 
+        await LaunchCoreAsync(runKey, $"[{runKey}] {entry.T}", arg, critical);
+    }
+
+    /// <summary>Single-shot launch + live echo + lights/bar/watchdog state machine. Shared by
+    /// the tree double-click path and the 开工装配 desk so both behave identically (261120).</summary>
+    private async Task LaunchCoreAsync(string runKey, string label, string? arg, bool critical)
+    {
         // ---- launch ----
         if (critical) _criticalRun = runKey;
         _activeCount++;
         _anyWarn = false;
         var cts = new CancellationTokenSource();
         _activeCts = cts;
+        try { _blocks.SetBusy(true); } catch { }
 
-        var label = $"[{runKey}] {entry.T}";
         _term.AppendCmd(label, Disp(runKey, arg));
         _btnKill.IsEnabled = true;
         _runningInfo.Text = "执行中: " + runKey;
@@ -768,6 +845,7 @@ public sealed class MainWindow : Window
             else if (res.ExitCode != 0) { _state.SetError(); BarFinal($"运行错误 exit={res.ExitCode} · {ElapStr(res.Elapsed)}", BarRed); }
             else if (_anyWarn) { _state.SetDone(true); BarFinal($"运行完毕（有提示） · {ElapStr(res.Elapsed)}", BarOrange); }
             else { _state.SetDone(false); BarFinal($"运行完毕 · {ElapStr(res.Elapsed)}", BarGreen); }
+            try { _blocks.SetBusy(false); _blocks.ForceProbe(); } catch { }
         }
         cts.Dispose();
     }
@@ -817,6 +895,17 @@ public sealed class MainWindow : Window
             }
 
             var m = await StatusProbe.SampleAsync(_cfg);
+
+            // assembly desk feed: the full -BlocksState probe costs ~3s of pwsh, so it runs on
+            // its own 10s cadence, never while a run is live, and only while the tab is open.
+            if (_tabOnAsm && _activeCount == 0 && _blocks != null && _blocks.DueForProbe())
+            {
+                var (bc, bo) = await ScriptRunner.CaptureAsync(_cfg, "-BlocksState", 15000);
+                BlocksDump? bd = null;
+                try { bd = JsonSerializer.Deserialize<BlocksDump>(bo.Trim()); } catch { }
+                if (bd != null && !_quitting) Dispatcher.Invoke(() => _blocks.ApplyDump(bd));
+            }
+
             (string text, bool warn)? gpu = null;
             if (++_statusTick % 10 == 1) gpu = await StatusProbe.GpuAsync();
             if (_quitting) return;

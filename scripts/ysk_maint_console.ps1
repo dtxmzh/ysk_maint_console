@@ -1,6 +1,8 @@
 ﻿param([switch]$ProbeOnly, [switch]$UpdateDirect, [switch]$StrataDirect, [switch]$KvmemDirect,
       [string]$Rank2Git = '', [string]$Rank2Dl = '',
-      [switch]$DumpMenu, [switch]$ListBak, [string]$Run = '', [string]$Arg = '')
+      [switch]$DumpMenu, [switch]$ListBak, [switch]$BlocksState, [string]$Run = '', [string]$Arg = '')
+# runtime contract (261120 master): pwsh-7 ONLY (GUI exe + bat launcher pin pwsh.exe); 5.1 is
+# never a supported host, so pwsh-7 idioms are fair game and every internal spawn uses pwsh.
 # -*- coding: utf-8 -*-
 # ============================================================================
 # ysk_maint_console.ps1 -- this machine's maintenance console (by Yosuko;
@@ -17,6 +19,10 @@
 #   group entries (q=back to main; menu text and the [x] map both come from one table):
 #     m>1 ws up    m>2 ws down   m>3 stop Strata  m>4 stop KVMem  m>5 free Ollama
 #     m>6 TeleCPU emergency up/down   m>8 arm KVMem resident (dual-engine, keeps Strata)
+#     m>9 mount 18201 OCR on GPU0     m>0 stand 18201 down (frees its GPU0 seat)
+#     m>a voice GPU up    m>b voice GPU down    m>c TeleOCR GPU up    m>d TeleOCR GPU down
+#   building-blocks policy (261120): [1] keeps every small model in place (ComfyUI + Ollama
+#   still evicted); all manual levers ignite via the hidden vbs and arm NO guard task
 #     u>1 upgr Strata  u>2 rollback Strata  u>3 upgr KVMem  u>4 V100 speed switches
 #     u>5 upgr Hermes  u>6 backup Hermes    u>7 recent upgrade receipts   u>8 restart 8080
 #     c>1 ComfyUI up  c>2 ComfyUI down  c>3 ComfyUI-CPU  c>4 launch Blender
@@ -49,7 +55,11 @@
 #   - workstation VRAM budget: GPU1 = KVMem 16G + TTS 4G + TeleOCR ~2.5G + light imggen ~10G
 #     GPU0 = heavy ComfyUI creative: img 8G / 5B video 14G / HY480p 24G / TRELLIS 24G / A14B 25G / HY720p 29G / Animate 30G max
 #     192G RAM carries: KVMem 240K KV offload + GGUF mmap page cache (2nd load in seconds) + ComfyUI switch buffer
-#   - Strata IS mutually exclusive with GPU SUITES (ComfyUI/whisper/TeleOCR/TTS-GPU/Blender); exception:
+#   - Strata IS mutually exclusive with whole-card GPU SUITES (ComfyUI/Blender); whisper/TeleOCR/
+#     TTS-GPU are only *presumed* exclusive from the old big-prealloc era -- measured 261120 evening
+#     the card split is elastic (Strata gave up ~10.6G when KVMem took GPU1 first), so [1] now keeps
+#     all small models seated and the master drives them with the m>a..m>d manual levers.
+#     Legacy exception line kept for reference:
 #     KVMem 18200 coexists as standby (dual-engine normal since 11-17) and 18201 Xiaomi runs its CPU
 #     build alongside Strata (dual-mode bat, zero VRAM) -- 2026-11-18 architecture
 #     dual-engine parallel fills all 64G -- any suite is locked out. Suite co-op requires KVMem-ONLY mode
@@ -65,6 +75,7 @@
 #   pwsh -File this.ps1 -KvmemDirect  = KVMem upgrade fully unattended (u>3; ~GB downloads MUST run out of gateway tree)
 #   pwsh -File this.ps1 -DumpMenu     = print the grouped menu tree (incl r/p/w metadata) as one JSON line
 #   pwsh -File this.ps1 -ListBak      = print engine\*.bak.exe inventory as JSON (GUI rollback radio source)
+#   pwsh -File this.ps1 -BlocksState  = assembly-desk blocks+vram JSON (GUI 开工装配 tab feed, 261120)
 #   pwsh -File this.ps1 -Run 'u>8' [-Arg v1,v2] = single-shot menu item then exit (GUI front-end core;
 #       mid-run prompts consume the comma-split -Arg queue first, then fall back to stdin)
 $ErrorActionPreference = "Continue"
@@ -80,6 +91,8 @@ $T_URL   = "http://127.0.0.1:9210"
 $TASK_S  = "ysk_strata_autostart"
 $TASK_K  = "ysk_kvmem_autostart"
 $TASK_OCR = "ysk_ocr_autostart"   # 18201 Xiaomi-OCR-0 DUAL-MODE guard (2026-11-18: GPU build when GPU0 free>=2300MB, else CPU build zero-VRAM ~1min/page)
+$OCR_BAT  = "E:\DSDeployMaster\ysk_autostart\ysk_serve_ocr.bat"   # the 18201 dual-mode bat+watchdog itself; launchable via $HID_VBS when the task is ACL-locked (261120)
+$TL_BAT   = "E:\DSDeployMaster\ysk_autostart\ysk_serve_teleocr.bat"  # 18205 GPU1 serve bat (own 2048MB gate + 30s self-heal), used by m>c without any guard task (261120)
 $TASK_TL  = "\ysk\ysk_teleocr_guard"   # 11-18 fix: real task lives under \ysk\ (bare name made schtasks /TN silently fail); 10-25: TeleOCR 18205 (main OCR head for vision in KVMem/creative scenes)
 $TASK_KV  = "\ysk\ysk_kvmem_vision_guard"   # 11-18 fix: \ysk\ prefix; 10-25: KV-vision 18206 (retired 10-27, guard kept for revival)
 $TASK_R   = "\ysk\ysk_vision_router_guard"   # 11-18 fix: \ysk\ prefix; 10-25: vision router 18207 (zero-VRAM CPU daemon)
@@ -185,7 +198,7 @@ function TaskRun($task) {
     if ($LASTEXITCODE -eq 0) { Note ("   重试成功: {0} 已拉起" -f $task); return }
     Note ("   仍被拒: " + $o2.Trim())
     Note "   多半是任务被禁用且 ACL 锁给 Administrators (属主非提权也改不动) -- UAC 提权定式:"
-    Note ("     Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile','-Command','schtasks /End /TN {0}; schtasks /Change /TN {0} /ENABLE; schtasks /Run /TN {0}'" -f $task)
+    Note ("     Start-Process pwsh -Verb RunAs -ArgumentList '-NoProfile','-Command','schtasks /End /TN {0}; schtasks /Change /TN {0} /ENABLE; schtasks /Run /TN {0}'" -f $task)
 }
 # kill watchdog hosts (bat/cmd/python) by commandline regex, so a stopped service is not resurrected by its own watchdog
 function KillGuard($pattern) {
@@ -233,16 +246,37 @@ function GpuReport() {
 # common yield: unload yosuko-tts GPU endpoint + evict whisper/bonsai + free Ollama (zero-VRAM trio stays: coexists anyway)
 # 11-04: senko (Qwen3-TTS lazy) -> yosuko (IndexTTS-2.5, CPU-resident + on-demand GPU dual endpoint); yield only unloads the GPU endpoint
 function FreeUpCard() {
-    Note "--- 让位: yosuko-tts GPU端点卸载 (GPU0; CPU端点常时驻留, 朗读不断) ---"
-    $r = Http "POST" "$T_URL/gpu/unload" $null 20
-    if ($r) { Note "   GPU 端点已让位" } else { Note "   TTS 没跑, 跳过" }
-
-    Note "--- 让位: 按需服务请走 (whisper 9003 / 小米OCR 18201双模式 / TeleOCR 18205 冷加载临时让位, Strata就绪后自动回挂并按显存自适应) ---"
-    foreach ($tk in "ysk_whisper_autostart", $TASK_OCR, $TASK_TL) { TaskStop $tk }
-    KillGuard "ysk_serve_ocr\.bat|ysk_task_ocr\.vbs|ysk_serve_teleocr|ysk_task_teleocr"
-    KillService "whisper-asr" 9003 | Out-Null
-    KillService "OCR-GPU版" 18201 | Out-Null
-    KillService "TeleOCR 18205" 18205 | Out-Null
+    # 261120 building-blocks policy (master): [1] no longer evicts ANY small model -- voice GPU,
+    #   whisper and TeleOCR all keep their seats through the cold-load and Strata reshifts its own
+    #   layer split instead (proved live 19:45-19:46 with KVMem holding 14.5G on GPU1).
+    #   Steps below are commented out, NOT deleted: un-comment to restore the old yield behaviour.
+    #   Still active in this flow: ComfyUI eviction (whole-card suite, in SwitchToStrata) + Ollama.
+    Note "--- 让位: 小模型一律不清场 (积木模式 261120; 声线GPU/whisper/TeleOCR/小米OCR 全部原地保留) ---"
+    # $r = Http "POST" "$T_URL/gpu/unload" $null 20
+    # if ($r) { Note "   GPU 端点已让位" } else { Note "   TTS 没跑, 跳过" }
+    # foreach ($tk in "ysk_whisper_autostart", $TASK_TL) { TaskStop $tk }
+    # KillGuard "ysk_serve_teleocr|ysk_task_teleocr"
+    # KillService "whisper-asr" 9003 | Out-Null
+    # KillService "TeleOCR 18205" 18205 | Out-Null
+    # 2026-11-20 master's call: [1] must NOT clear 18201 (it is the always-available CPU-side OCR).
+    #   The zero-VRAM CPU build stays untouched; only a GPU build holding ~2.8G on GPU0 is borrowed
+    #   back for the cold-load window, and the re-arm block below brings it right back (the dual-mode
+    #   bat then auto-drops to CPU mode on its own once the seats are full).
+    if (PortPid 18201) {
+        if ((OcrBuildMode) -eq 'cpu') {
+            Note "   小米OCR 18201 = CPU 版 (零显存) -- 保留不动, Strata 冷加载不受影响"
+        } else {
+            # 261120 master's test order -- kept alive, NOT deleted: Strata's VRAM appetite is
+            #   elastic (layer-split auto + KV/RAM offload; proved 19:45-19:46 when KVMem took
+            #   14.5G on GPU1 first and Strata still cold-loaded fine by reshifting its own
+            #   split). So the GPU build of 18201 is left in place through the cold-load and we
+            #   watch whether it really needs that seat. Un-comment both lines to restore the
+            #   old borrow-back; m>0 always frees the seat by hand.
+            Note "   小米OCR 18201 = GPU 版 (占 GPU0 约2.8G) -- 按主人测试令不清除, 直接与 Strata 冷加载共存"
+            # KillGuard "ysk_serve_ocr\.bat|ysk_task_ocr\.vbs"
+            # KillService "小米OCR 18201 (GPU版)" 18201 | Out-Null
+        }
+    }
 
     Note "--- 让位: Ollama 卸载已装载模型 (keep_alive=0) ---"
     $loaded = @()
@@ -333,12 +367,24 @@ function SwitchToStrata {
     # Also re-arm TeleOCR 18205 guard (GPU-side ONLY head; its bat waits while GPU1 tight,
     # mounts in single-engine states). Router 18207 auto-prefers 18205 when it is up.
     if (PortPid 18201) {
-        Note "   小米OCR 18201 已在监听 -- 无需回挂"
+        Note ("   小米OCR 18201 在岗未动 (" + (OcrBuildMode) + " 模式) -- 无需回挂")
     } else {
         Note "--- Strata 就绪后自动回挂 18201 小米 (双模式bat按显存自适应 GPU/CPU) ---"
         TaskRun $TASK_OCR
         Start-Sleep -Seconds 8
-        if (PortPid 18201) { Note "   18201 已回挂 OK" } else { Note "   18201 未即时起(权重加载中), 守护会自行重试, 不影响Strata" }
+        # 261120 real case: ysk_ocr_autostart ACL is locked to Administrators -- unelevated Enable
+        #   reads as a silent fake-success (Cmdlet) or hard denial (schtasks), and /Run then answers
+        #   "could not run because it is disabled" -> 18201 used to stay offline after every [1].
+        #   Fallback = the hidden-vbs launcher (zero-VRAM-safe: the bat re-probes GPU0 itself).
+        if (-not (PortPid 18201)) {
+            Note "   计划任务没能拉起 (任务 Disabled 且 ACL 锁管理员) -- 静默 vbs 直起兜底"
+            wscript //nologo $HID_VBS $OCR_BAT 2>&1 | Out-Null
+            for ($i = 0; $i -lt 24; $i++) {
+                Start-Sleep -Seconds 5
+                if ((Http "GET" $OCRG_URL $null 3) -eq 200) { break }
+            }
+        }
+        if (PortPid 18201) { Note ("   18201 已回挂 OK (" + (OcrBuildMode) + " 模式)") } else { Note "   18201 未即时起(权重加载中), 守护/vbs 会自行再来, 不影响Strata" }
     }
     if (-not (PortPid 18205)) {
         Note "--- 回挂 TeleOCR 守护 (18205, GPU1 有座时自动上岗; 双引擎态罚站属正常) ---"
@@ -528,21 +574,25 @@ function CleanupKvmem {
 # [m>8] KVMem resident ignition WITHOUT evicting Strata (dual-engine form, 2026-11-17 master's call:
 #       Strata = main chat, KVMem = always-on spare/clone; guard stays enabled for auto-respawn)
 # ---------------------------------------------------------------------------
-function ArmKvmemResident {
-    Note "=================== KVMem 常驻点火 · 不动 Strata (双引擎并行) ==================="
+function ArmKvmemResident([string]$Pick = 'auto') {
+    $pk = switch ($Pick) { 'gpu0' { '0' } default { '1' } }
+    $pkName = switch ($Pick) { 'cpu' { 'CPU(ninfer不支持)' } 'gpu0' { 'GPU0' } default { 'GPU1' } }
+    if ($Pick -eq 'cpu') { Note "=================== KVMem 无 CPU 形态 (ninfer 容器需 GPU; 要清显存按 m>4 清洁退出) ==================="; return }
+    Note ("=================== KVMem 常驻点火 · 指定卡 " + $pkName + " · 不动 Strata ===================")
     Note "GPU 起始:"; GpuReport
     if (PortPid 8080) { Note "   Strata 8080 在线 -- 主力仍 Strata, 本项只补 KVMem 备胎体" } else { Note "   注意: Strata 当前离线 -- KVMem 先起, Strata 守护上线后即成双引擎" }
     if (PortPid 18200) {
         Note "   18200 已在监听 -- 复用当前 KVMem (不走 TaskRun, 守护不被误杀)"
     } else {
-        $fbk = @(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>$null | Where-Object { "$_".Trim() -match '^\d+$' })
-        $g1k = if ($fbk.Count -ge 2) { [int]$fbk[1].Trim() } else { 0 }
+        $g1k = GpuFreeMib ([int]$pk)
         if ($g1k -lt 14800) {
-            Note ("   !! GPU1 空闲 " + [math]::Round($g1k/1024,1) + "GB -- 不足落座门槛 14800MB(约14.45GB), KVMem 无空间 (先 m>5 卸 Ollama / m>4 清 KVMem 残骸 / m>2 拆工作站再试)")
+            Note ("   !! " + $pkName + " 空闲 " + [math]::Round($g1k/1024,1) + "GB -- 不足落座门槛 14800MB(约14.45GB), KVMem 无空间 (先 m>5 卸 Ollama / m>4 清 KVMem 残骸 / 换另一张卡再试)")
             return
         }
-        Note "--- 点火 KVMem (18200, GPU1, 不动 provider 与视觉编排) ---"
-        TaskRun $TASK_K
+        Note ("--- 点火 KVMem (18200, " + $pkName + ", 直起 bat 带 YSK_GPU; serve 环自带 60s 重试) ---")
+        $env:YSK_GPU = $pk
+        wscript //nologo $HID_VBS "E:\DSDeployMaster\ysk_autostart\ysk_serve_kvmem.bat" 2>&1 | Out-Null
+        Remove-Item Env:YSK_GPU -ErrorAction SilentlyContinue
         $kready = $false
         for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 5
@@ -563,6 +613,7 @@ function ArmKvmemResident {
     # NOTE: Enable-ScheduledTask cmdlet is DENIED by ysk_* task ACL (11-17 m>8 live test); schtasks /Change works (same as TaskStop/TaskRun)
     & schtasks /Change /TN $TASK_K /ENABLE 2>&1 | Out-Null
     if ($LASTEXITCODE -eq 0) { Note "   KVMem 守护任务已启用 (猝死自动复活)" } else { Note ("   !! schtasks /Change /ENABLE 失败 exit=" + $LASTEXITCODE + " -- 需管理员权限，请以管理员身份重开操作台处理") }
+    if ($pk -eq '0') { Note "   提醒: 本次直起坐 GPU0; 若日后守护任务自动复活会回到 bat 内置默认卡 GPU1 (守护环境不带 YSK_GPU)" }
     Note "--- 终态 ---"
     Note "   双卡显存:"; GpuReport
     Note ("   8080 http=" + (Http "GET" $S_URL $null 3) + "   18200 http=" + (Http "GET" $K_URL $null 3))
@@ -768,26 +819,35 @@ function FreeOllama {
 }
 
 # [c>1] ComfyUI up (GPU0 creative card, 8G gate; only in KVMem workstation mode -- impossible while Strata holds both cards)
-function StartComfyUI {
-    Note "=================== ComfyUI 启动 ==================="
+function StartComfyUI([string]$Pick = 'auto') {
+    $pk = switch ($Pick) { 'gpu1' { '1' } 'cpu' { '-1' } default { '0' } }
+    $pkName = switch ($Pick) { 'cpu' { 'CPU(--cpu 极慢)' } 'gpu1' { 'GPU1' } default { 'GPU0' } }
+    Note ("=================== ComfyUI 启动 (" + $pkName + ") ===================")
     if (PortPid 8188) { Note "   ComfyUI 已在跑 (8188), 复用"; return }
-    $freeLine = (nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | Select-String "^0,")
-    $freeMb = [int](($freeLine -split ",")[1].Trim())
-    if ($freeMb -lt 8000) {
-        Note ("   !! GPU0 空闲仅 " + [math]::Round($freeMb/1024,1) + "GB -- Strata 大概率在双卡独占")
-        Note "      请先回一级菜单 [2] 切 KVMem 创作协同 (GPU0 整卡让出), 再回来重开"
-        return
-    }
-    if ($freeMb -lt 24000) {
-        Note ("   提示: GPU0 空闲 " + [math]::Round($freeMb/1024,1) + "GB -- 出图/5B视频/HY480p/TRELLIS 够用;")
-        Note "         Animate/A14B/HY720p 等 24G+ 重活前请先跑 m>5 Ollama卸载 + c>6 whisper关闭 再挤一挤"
+    if ($Pick -eq 'cpu') {
+        # comfy wants the explicit --cpu flag (a plain hidden-CUDA boot dies on import guards)
+        $env:COMFY_EXTRA = '--cpu'
+    } else {
+        $freeMb = GpuFreeMib ([int]$pk)
+        if ($freeMb -lt 8000) {
+            Note ("   !! " + $pkName + " 空闲仅 " + [math]::Round($freeMb/1024,1) + "GB -- Strata 大概率在双卡独占")
+            Note "      换另一张卡 / 先一级 [2] 切 KVMem 创作协同整卡让出 / 或选 CPU, 再回来重开"
+            return
+        }
+        if ($freeMb -lt 24000) {
+            Note ("   提示: " + $pkName + " 空闲 " + [math]::Round($freeMb/1024,1) + "GB -- 出图/5B视频/HY480p/TRELLIS 够用;")
+            Note "         Animate/A14B/HY720p 等 24G+ 重活前请先跑 m>5 Ollama卸载 + c>6 whisper关闭 再挤一挤"
+        }
     }
     $vbs = "E:\DSDeployMaster\ysk_autostart\ysk_task_comfy.vbs"
     if (-not (Test-Path $vbs)) { Note ("   !! 缺启动 vbs: " + $vbs); return }
+    $env:YSK_GPU = $pk
     Start-Process wscript.exe -ArgumentList ('"' + $vbs + '"')
+    Remove-Item Env:YSK_GPU -ErrorAction SilentlyContinue
+    if ($Pick -eq 'cpu') { Remove-Item Env:COMFY_EXTRA -ErrorAction SilentlyContinue }
     $ok = $false
     for ($i=0; $i -lt 36; $i++) { Start-Sleep -Seconds 5; if (PortPid 8188) { $ok=$true; break } }
-    if ($ok) { Note "   ComfyUI 已就绪 OK (http://127.0.0.1:8188, GPU0)" } else { Note "   !! 3分钟未就绪 -- 看 %TEMP%\comfyui.log" }
+    if ($ok) { Note ("   ComfyUI 已就绪 OK (http://127.0.0.1:8188, " + $pkName + ")") } else { Note "   !! 3分钟未就绪 -- 看 comfyui_server.log" }
     Note "==================="
 }
 
@@ -798,20 +858,26 @@ function StopComfyUI {
 }
 
 # [c>5] whisper ASR up
-function StartWhisper {
-    Note "=================== whisper ASR 启动 ==================="
+function StartWhisper([string]$Pick = 'auto') {
+    $pk = switch ($Pick) { 'gpu0' { '0' } 'cpu' { '-1' } default { '1' } }
+    $pkName = switch ($Pick) { 'cpu' { 'CPU(int8, 零显存慢)' } 'gpu0' { 'GPU0' } default { 'GPU1' } }
+    Note ("=================== whisper ASR 启动 (" + $pkName + ") ===================")
     if (PortPid 9003) { Note "   9003 已在监听, 复用"; return }
-    # 2026-11-17: whisper sits on GPU1 (~4-5G) -- under Strata/dual-engine full cards it OOMs instantly; admission gate added
-    $fbw = @(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>$null | Where-Object { "$_".Trim() -match '^\d+$' })
-    $g1w = if ($fbw.Count -ge 2) { [int]$fbw[1].Trim() } else { 0 }
-    if ($g1w -lt 6000) {
-        Note ("   !! GPU1 空闲仅 " + [math]::Round($g1w/1024,1) + "GB -- 显存满座 (Strata/双引擎), whisper 挤不下")
-        Note "      先走一级 [2] 切 KVMem 单独态 (Strata 退出后 GPU1 约空 17G) 再来拉起"
-        return
+    # 261120 card pick: env YSK_GPU rides to start.bat; -1 hides CUDA -> CPU int8. ~4-5G GPU
+    # footprint needs an admission gate on the PICKED card (Strata full cards OOM instantly).
+    if ($Pick -ne 'cpu') {
+        $g1w = GpuFreeMib ([int]$pk)
+        if ($g1w -lt 6000) {
+            Note ("   !! " + $pkName + " 空闲仅 " + [math]::Round($g1w/1024,1) + "GB -- 显存满座 (Strata/双引擎), whisper 挤不下")
+            Note "      换另一张卡 / 选 CPU / 或一级 [2] 切 KVMem 单独态腾地方再来"
+            return
+        }
     }
     $vbs = "E:\DSDeployMaster\ysk_autostart\ysk_task_whisper.vbs"
     if (-not (Test-Path $vbs)) { Note ("   !! 缺启动 vbs: " + $vbs); return }
+    $env:YSK_GPU = $pk
     Start-Process wscript.exe -ArgumentList ('"' + $vbs + '"')
+    Remove-Item Env:YSK_GPU -ErrorAction SilentlyContinue
     $ok = $false
     for ($i=0; $i -lt 24; $i++) { Start-Sleep -Seconds 5; if (PortPid 9003) { $ok=$true; break } }
     if ($ok) { Note "   whisper 已就绪 OK (9003)" } else { Note "   !! 2分钟未就绪 -- 查 whisper-asr 日志" }
@@ -849,6 +915,568 @@ function StopOcrCpu {
     KillService "TeleCPU应急 18205" 18205 | Out-Null
     Note "   双引擎态 OCR 自动回 18201 小米(CPU模式), router 自行择优无需改配置"
     Note "=================== TeleCPU 收回完成 ==================="
+}
+
+# Which build the 18201 endpoint runs: 'cpu' (-ngl 0, zero VRAM, ~1min/page) | 'gpu' (-ngl 99,
+#   ~2.8G on GPU0, 4-5s/page) | $null when the port has no listener. Read from the live command
+#   line because the dual-mode bat picks the build by GPU0 free space at start time only.
+function OcrBuildMode {
+    $p = PortPid 18201
+    if (-not $p) { return $null }
+    $c = (Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue).CommandLine
+    if (-not $c) { return 'gpu' }
+    if ($c -match '-ngl\s+0(\s|$)') { return 'cpu' }
+    return 'gpu'
+}
+function GpuFreeMib($idx) {
+    $f = @(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>$null | Where-Object { "$_".Trim() -match '^\d+$' })
+    if ($f.Count -gt $idx) { return [int]$f[$idx].Trim() }
+    return 0
+}
+
+# [m>9] mount 18201 Xiaomi-OCR on GPU0 as the GPU build (2026-11-20 master's request: a manual
+#   lever onto/off the GPU seat). The dual-mode bat itself decides GPU/CPU by GPU0 free space,
+#   so this entry = guarantee the seat (>=2300MB, same gate as the bat), restart a CPU build
+#   that is already sitting there, then verify the live process really is -ngl 99.
+function ArmOcrGpu([string]$Pick = 'auto') {
+    # card pick (261120): auto=gpu0 | gpu0 | gpu1 | cpu(-ngl 0 zero-VRAM build, forced)
+    $pk = switch ($Pick) { 'gpu1' { '1' } 'cpu' { '-1' } default { '0' } }
+    $pkName = switch ($Pick) { 'cpu' { 'CPU强制版(零显存)' } 'gpu1' { 'GPU1' } default { 'GPU0' } }
+    if ($Pick -eq 'cpu') {
+        if ((OcrBuildMode) -eq 'cpu') { Note "   小米OCR 已在 CPU 版在岗 (零显存) -- 无需再动"; return }
+        if ((OcrBuildMode) -eq 'gpu') {
+            Note "   当前 GPU 版 -- 请走重起为 CPU 强制版 (中途 OCR 断约1分钟)"
+            TaskStop $TASK_OCR
+            KillGuard "ysk_serve_ocr\.bat|ysk_task_ocr\.vbs"
+            KillService "小米OCR 18201 (GPU版)" 18201 | Out-Null
+        }
+        Note "--- CPU 强制点火 (YSK_GPU=-1 -> 双模式bat直落 -ngl 0 零显存分支) ---"
+        $env:YSK_GPU = '-1'
+        wscript //nologo $HID_VBS $OCR_BAT 2>&1 | Out-Null
+        Remove-Item Env:YSK_GPU -ErrorAction SilentlyContinue
+        $cokO = $false
+        for ($i = 0; $i -lt 24; $i++) { Start-Sleep -Seconds 5; if ((Http "GET" $OCRG_URL $null 3) -eq 200) { $cokO = $true; break } }
+        if ($cokO) { Note "   18201 CPU 强制版已上岗 OK (零显存, ~1min/页)" } else { Note "   !! 2分钟未就绪 -- 查 xiaomi_ocr_cpu.log" }
+        return
+    }
+    Note ("=================== 小米OCR 18201 载入 " + $pkName + " (GPU版 4~5s/页) ===================")
+    Note "GPU 起始:"; GpuReport
+    $mode = OcrBuildMode
+    $g0 = GpuFreeMib ([int]$pk)
+    if ($mode -eq 'gpu') {
+        Note ("   18201 已在 GPU 版上岗 (GPU0 空闲 " + [math]::Round($g0/1024,1) + "GB) -- 无需再动")
+        Note "=================== 已在岗, 完成 ==================="
+        return
+    }
+    if ($g0 -lt 2300) {
+        Note ("   !! " + $pkName + " 空闲 " + [math]::Round($g0/1024,1) + "GB < 上岗门槛 2300MB -- 上不了卡 (换 m>0 退出 / 选另一张卡 / CPU版)")
+        Note "      先 m>0 请走 18201 现实例 / c>2 停 ComfyUI / 一级[2] 切 KVMem 单独态腾地方, 再回来按 m>9"
+        Note "=================== 显存不足, 未上岗 ==================="
+        return
+    }
+    if ($mode -eq 'cpu') {
+        Note "   当前是 CPU 版 (零显存) -- 先请走再按 GPU 版重起 (中途 OCR 会断约1分钟)"
+        TaskStop $TASK_OCR
+        KillGuard "ysk_serve_ocr\.bat|ysk_task_ocr\.vbs"
+        KillService "小米OCR 18201 (CPU版)" 18201 | Out-Null
+    }
+    Note ("--- 点火 18201 (静默 vbs 直起, 指定卡 " + $pkName + "; 双模式bat自查该卡空闲>=2300MB -> GPU 版) ---")
+    $env:YSK_GPU = $pk
+    wscript //nologo $HID_VBS $OCR_BAT 2>&1 | Out-Null
+    Remove-Item Env:YSK_GPU -ErrorAction SilentlyContinue
+    $oready = $false
+    for ($i = 0; $i -lt 24; $i++) {   # 0.8B GPU build measured ~40s
+        Start-Sleep -Seconds 5
+        if ((Http "GET" $OCRG_URL $null 3) -eq 200) { $oready = $true; break }
+    }
+    if (-not $oready) {
+        Note "   !! 18201 两分钟未就绪 -- 查 E:\DSDeployMaster\ysk_autostart\xiaomi_ocr_cpu.log"
+        Note "=================== 上岗失败, 回菜单可重跑 ==================="
+        return
+    }
+    $m2 = OcrBuildMode
+    if ($m2 -eq 'gpu') { Note "   18201 GPU 版已上岗 OK (4~5s/页)" } else { Note "   起来了但不是 GPU 版 -- bat 探到空隙不足自动转了 CPU 版, 属正常保护" }
+    # best-effort guard re-arm: this task's ACL is locked to Administrators, so unelevated
+    #   Enable fails (261120) -- then the vbs instance simply has no auto-respawn, no harm.
+    # Manual-lever policy (261120 master): no guard task is armed for any manual entry. The
+    #   serve bat already carries its own 30s self-heal loop, so a plain crash still recovers,
+    #   while a deterministic bad-config failure is not replayed by a scheduled task forever.
+    Note "   按主人积木令: 不启用计划任务守护 (serve bat 自带 30s 自愈; 开机不自启属预期)"
+    Note "--- 终态 ---"; GpuReport
+    Note (   "   18201 http=" + (Http "GET" $OCRG_URL $null 3) + "  18205 http=" + (Http "GET" "http://127.0.0.1:18205/v1/models" $null 3))
+    Note "   视觉网关 18207 自动探到 18201, Hermes 配置无需改动"
+    Note "=================== 18201 GPU 上岗完毕 ==================="
+}
+
+# [m>0] stand 18201 down and free its GPU0 seat (the other half of the master's manual lever).
+#   Watchdog hosts go first so the bat does not resurrect the endpoint mid-teardown.
+function StanddownOcr {
+    Note "=================== 小米OCR 18201 退出 (释放显存) ==================="
+    if (-not (PortPid 18201)) {
+        Note "   18201 本来就没在监听 -- 无事可做 (要上岗按 m>9)"
+        return
+    }
+    $mode = OcrBuildMode
+    Note ("   当前模式: " + $mode + " -- 停守护 + 杀宿主 + 请走实例")
+    TaskStop $TASK_OCR
+    KillGuard "ysk_serve_ocr\.bat|ysk_task_ocr\.vbs|ysk_run_hidden\.vbs.*ysk_serve_ocr"
+    KillService ("小米OCR 18201 (" + $mode + "模式)") 18201 | Out-Null
+    Start-Sleep -Seconds 3
+    if (PortPid 18201) {
+        Note "   仍在监听 -- 宿主没杀干净, 补一轮"
+        KillGuard "ysk_serve_ocr\.bat|ysk_task_ocr\.vbs|ysk_run_hidden\.vbs.*ysk_serve_ocr"
+        KillService "小米OCR 18201" 18201 | Out-Null
+    }
+    Note "--- 终态 ---"; GpuReport
+    Note (   "   18201 http=" + [string](Http "GET" $OCRG_URL $null 3) + "  (空=已离线)")
+    Note "   视觉网关 18207 自动降级: 18205 TeleOCR 在岗就用它, 两头皆无则由 VL 头兜底 (逐字精度会降)"
+    Note "   要再上岗: m>9 (GPU0 空隙>=2300MB 时才会真上卡)"
+    Note "=================== 18201 已退出 ==================="
+}
+
+# ---------------------------------------------------------------------------
+# BUILDING BLOCKS (261120, master's policy): every small model gets a manual lever and NO
+# scheduled guard. A watchdog only guarantees "alive", not "right" -- on a deterministic
+# failure (bad args / bad config / no VRAM seat) it replays the same crash forever and the
+# human has to kill it anyway. Ignition always goes through the hidden-vbs launcher.
+# ---------------------------------------------------------------------------
+function TtsHealth {
+    try { return ((Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 "$T_URL/health").Content | ConvertFrom-Json) } catch { return $null }
+}
+# [m>a] mount the yosuko-tts GPU endpoint (real-time speech). Gate = the service's own
+#   GPU_MIN_FREE_GIB (env YOSUKO_GPU_MIN_GIB, default 8G on GPU0). Load it while Strata is
+#   still off the card: the precheck only runs at load time, a live endpoint never yields.
+function ArmTtsGpu([string]$Pick = 'auto') {
+    # card pick: auto/gpu0 -> server default (env YOSUKO_GPU_DEVICE, today GPU0); gpu1 via
+    # /gpu/load?device=1 (needs the 261120 server.py running -- a pre-restart 9210 ignores the
+    # query param and lands on GPU0, which we report honestly); cpu = keep endpoint unloaded.
+    $pk = switch ($Pick) { 'gpu1' { '1' } default { '0' } }
+    $pkName = switch ($Pick) { 'gpu1' { 'GPU1' } default { 'GPU0' } }
+    if ($Pick -eq 'cpu') {
+        Note "=================== 缘狐声线 CPU 选择: GPU 端点不挂 (CPU 主路常驻, 朗读不断) ==================="
+        StanddownTtsGpu
+        return
+    }
+    Note ("=================== 缘狐声线 上 GPU · 指定卡 " + $pkName + " (9210 实时朗读提速) ===================")
+    $h = TtsHealth
+    if (-not $h) {
+        Note "   !! 9210 没在回答 -- 先起 yosuko-tts 本体 (计划任务 ysk_yosuko_autostart 已在位), 再按本项"
+        return
+    }
+    Note ("   门槛: GPU0 空闲需 >= " + $h.gpu.min_free_gib + "G | 当前 " + $h.gpu.free_now_gib + "G | gpu.state=" + $h.gpu.state)
+    if ($h.gpu.state -eq 'ready') {
+        Note ("   GPU 端点已在岗 ready (上次加载 " + $h.gpu.last_load_sec + "s) -- 无需再动, 合成已自动走 GPU")
+        return
+    }
+    $gfK = [math]::Round((GpuFreeMib ([int]$pk)) / 1024, 1)
+    if ($gfK -lt [double]$h.gpu.min_free_gib) {
+        Note ("   !! " + $pkName + " 空隙不够 (" + $gfK + "G < 门槛 " + $h.gpu.min_free_gib + "G), 服务会拒载不动主力 -- 两条路:")
+        Note "      ① 推荐时序: m>3 让 Strata 下场 -> 按 m>a -> 再回一级 [1] 拉 Strata (积木共存)"
+        Note "      ② 或把 TTS 门槛调低: ysk_serve_yosuko.bat 里 set YOSUKO_GPU_MIN_GIB=3 后重启 TTS (重启会让 CPU 端点重载约3分钟, 朗读短暂不可用)"
+        Note "=================== 未上岗, 回菜单 ==================="
+        return
+    }
+    Note ("--- POST /gpu/load?device=" + $pk + " (fp32, 首次加载约1~3分钟) ---")
+    $t0 = Get-Date
+    $r = Http "POST" ($T_URL + "/gpu/load?device=" + $pk) $null 240
+    Note ("   /gpu/load 返回 http=" + $r)
+    $gon = $false; $h2 = $null
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Seconds 5
+        $h2 = TtsHealth
+        if ($h2 -and $h2.gpu.state -eq 'ready') { $gon = $true; break }
+    }
+    if (-not $gon) {
+        $err = if ($h2) { $h2.gpu.error } else { 'health unreachable' }
+        Note ("   !! 3分钟未就绪 -- 查 E:\DSDeployMaster\ysk_autostart\yosuko_server.log (error=" + $err + ")")
+        Note "=================== 上岗失败, 回菜单可重跑 ==================="
+        return
+    }
+    $devTxt = if ($null -ne $h2.gpu.device) { 'GPU' + $h2.gpu.device } else { 'GPU0 (在跑的服务版尚未上报卡信息 -- 9210 重启后选卡才真正生效, 本次固定 GPU0)' }
+    Note ("   GPU 端点就绪 OK, 实测等待 " + [math]::Round(((Get-Date) - $t0).TotalSeconds, 1) + "s, 实坐 " + $devTxt + "; device_policy=auto 之后合成自动走 GPU")
+    if ([double]$h2.gpu.idle_unload_sec -lt 86400) {
+        Note ("   提醒: 空闲 " + [int]([double]$h2.gpu.idle_unload_sec / 60) + " 分钟会自动卸回 CPU (env YOSUKO_GPU_IDLE_SECONDS) -- 要常驻改大该 env 后重启 TTS")
+    }
+    Note "--- 终态 ---"; GpuReport
+    Note "=================== 声线 GPU 上岗完毕 ==================="
+}
+# [m>b] hand the voice GPU seat back (CPU endpoint stays resident, speech still works, just slow)
+function StanddownTtsGpu {
+    Note "=================== 缘狐声线 下 GPU (让位显存) ==================="
+    $r = Http "POST" "$T_URL/gpu/unload" $null 30
+    if (-not $r) { Note "   9210 没在回答 -- 跳过"; return }
+    Start-Sleep -Seconds 4
+    $h = TtsHealth
+    if ($h) {
+        Note ("   gpu.state=" + $h.gpu.state + "  cpu.state=" + $h.cpu.state + " (CPU 端点常驻, 朗读不断, 只是回到 71字/149秒 那档)")
+    } else { Note "   health 读不到" }
+    Note "--- 终态 ---"; GpuReport
+    Note "=================== 声线 GPU 已让位 ==================="
+}
+# [m>c] TeleOCR 18205 onto GPU1 (fastest OCR, 3~5s/page; gate = 2048MB on GPU1, same as its bat).
+#   Launched by the hidden vbs straight at serve_teleocr.bat -- no scheduled guard by policy.
+function ArmTeleocrGpu([string]$Pick = 'auto') {
+    $pk = switch ($Pick) { 'gpu0' { '0' } default { '1' } }
+    $pkName = switch ($Pick) { 'cpu' { 'CPU版(~26min/页应急)' } 'gpu0' { 'GPU0' } default { 'GPU1' } }
+    Note ("=================== TeleOCR 18205 上岗 " + $pkName + " ===================")
+    if ($Pick -eq 'cpu') {
+        if (PortPid 18205) { Note "   18205 已在监听 -- 复用当前实例"; return }
+        StartOcrCpu   # the proven TeleCPU bat (--cpu flag, zero VRAM)
+        return
+    }
+    if (PortPid 18205) {
+        Note "   18205 已在监听 -- 复用当前实例, 无需再动"
+        return
+    }
+    $g1 = GpuFreeMib ([int]$pk)
+    if ($g1 -lt 2048) {
+        Note ("   !! " + $pkName + " 空闲 " + [math]::Round($g1 / 1024, 1) + "GB < 门槛 2048MB -- 上不了卡 (Strata 满座期属正常)")
+        Note "      要 OCR 就用 m>9 (小米 GPU/CPU 双模式) 或 m>6 (TeleCPU 应急, 慢)"
+        Note "=================== 显存不足, 未上岗 ==================="
+        return
+    }
+    Note ("--- 点火 (静默 vbs 直起 serve_teleocr.bat, 指定卡 " + $pkName + "; 不启用计划任务守护) ---")
+    $env:YSK_GPU = $pk
+    wscript //nologo $HID_VBS $TL_BAT 2>&1 | Out-Null
+    Remove-Item Env:YSK_GPU -ErrorAction SilentlyContinue
+    $tready = $false
+    for ($i = 0; $i -lt 24; $i++) {
+        Start-Sleep -Seconds 5
+        if ((Http "GET" "http://127.0.0.1:18205/v1/models" $null 3) -eq 200) { $tready = $true; break }
+    }
+    if (-not $tready) { Note "   !! 2分钟未就绪 -- 查 E:\DSDeployMaster\ysk_autostart\teleocr_server.log"; return }
+    Note "   TeleOCR 18205 已就绪 OK (GPU1); 18207 网关会自动优先用它"
+    Note "--- 终态 ---"; GpuReport
+    Note "=================== TeleOCR 上岗完毕 ==================="
+}
+# [m>d] take TeleOCR 18205 off (watchdog hosts first so its 30s self-heal cannot resurrect it)
+function StanddownTeleocr {
+    Note "=================== TeleOCR 18205 收回 (释放 GPU1) ==================="
+    if (-not (PortPid 18205)) {
+        Note "   18205 本来就没在监听 -- 无事可做"
+        return
+    }
+    KillGuard "ysk_serve_teleocr|ysk_task_teleocr|ysk_run_hidden\.vbs.*teleocr"
+    KillService "TeleOCR 18205" 18205 | Out-Null
+    Start-Sleep -Seconds 3
+    if (PortPid 18205) {
+        Note "   仍在监听 -- 补一轮宿主清理"
+        KillGuard "ysk_serve_teleocr|ysk_task_teleocr|ysk_run_hidden\.vbs.*teleocr"
+        KillService "TeleOCR 18205" 18205 | Out-Null
+    }
+    Note "--- 终态 ---"; GpuReport
+    Note "   OCR 自动回到 18201 小米(或 18207 退化到 VL 头), router 自行择优无需改配置"
+    Note "=================== TeleOCR 已收回 ==================="
+}
+
+# ---------------------------------------------------------------------------
+# [b] ASSEMBLY DESK (261120 master's build-blocks design; the GUI first tab "开工装配"
+#   is just a paint of this data -- -BlocksState is the single source of truth, so a
+#   block added to $BLOCKS shows up in the window without touching the C# side).
+#   Two boxes per block: main = resident (on card whenever the seat fits), guard = its
+#   scheduled task armed. Semantics (master 261120): unchecked = leave completely;
+#   checked = mount BEFORE Strata, because every gate below is evaluated at load time
+#   only while Strata's card split is elastic and yields afterwards. ComfyUI checked ==
+#   "no Strata this round" (it wants whole GPU0, genuinely exclusive). The TTS main box
+#   covers its GPU endpoint only: the CPU voice core always stays resident (killing
+#   9210 would silence the chat, and unchecking only hands the ~2G GPU seat back).
+#   Guard-task writes are folded into ONE elevated pass at the very end (UAC pops at
+#   most once; the helper exits by itself) -- plain and elevated powershell never mix,
+#   so a plain window can never strand an elevated-owned task.
+#   Display order = assembly priority (most-likely-used first, master 261120).
+# ---------------------------------------------------------------------------
+$BLOCKS = [ordered]@{
+    # cards = GUI dropdown options (auto = that block's built-in default card, see dflt);
+    # the pick rides to the bats as env YSK_GPU / to TTS as /gpu/load?device=N (261120).
+    'tts'      = @{ n = '缘狐声线 9210'; full = 'IndexTTS-2.5 语音端点 (GPU加速提速朗读, CPU主路常驻不断声)'; port = 9210; g = 'ysk_yosuko_autostart'; gate = '任意卡空闲≥8G'; zero = $false; dflt = 'GPU0'; cards = @('auto','gpu0','gpu1','cpu') }
+    'ocr'      = @{ n = '小米OCR 18201'; full = 'Xiaomi-OCR-0 双模式 (上卡4~5s/页, CPU版~1min/页零显存)';    port = 18201; g = 'ysk_ocr_autostart';   gate = '任意卡空闲≥2300MB'; zero = $false; dflt = 'GPU0'; cards = @('auto','gpu0','gpu1','cpu') }
+    'kvm'      = @{ n = 'KVMem 18200';   full = 'KVMem-27B 副引擎 (大件14.5G, 常驻备胎/分身; ninfer不支持CPU)'; port = 18200; g = 'ysk_kvmem_autostart'; gate = '任意卡空闲≥14800MB'; zero = $false; dflt = 'GPU1'; cards = @('auto','gpu0','gpu1') }
+    'tele'     = @{ n = 'TeleOCR 18205'; full = 'TeleOCR (最快OCR 3~5s/页; CPU版~26min/页应急)';           port = 18205; g = '\ysk\ysk_teleocr_guard'; gate = '任意卡空闲≥2048MB'; zero = $false; dflt = 'GPU1'; cards = @('auto','gpu0','gpu1','cpu') }
+    'comfy'    = @{ n = 'ComfyUI 8188';  full = '出图套件 (独吞一张卡, 勾选则本轮不拉Strata; CPU极慢)';      port = 8188;  g = '';                   gate = '单卡空闲≥8G'; zero = $false; dflt = 'GPU0'; cards = @('auto','gpu0','gpu1','cpu') }
+    'whisper'  = @{ n = 'whisper 9003';  full = 'whisper large-v3 ASR (长录音转写; CPU int8零显存慢)';       port = 9003; g = 'ysk_whisper_autostart'; gate = '任意卡空闲≥6G'; zero = $false; dflt = 'GPU1'; cards = @('auto','gpu0','gpu1','cpu') }
+    'brain'    = @{ n = '调度官 18202';  full = 'Qwen3-0.6B 命令审批调度 (纯CPU零显存)';                 port = 18202; g = 'ysk_brain_autostart';   gate = '零显存·无卡可选'; zero = $true; dflt = 'CPU'; cards = @('cpu') }
+    'vlembed'  = @{ n = '嵌入 18303';    full = 'qwen3-vl-embedding-2b (纯CPU零显存, 记忆检索用)';       port = 18303; g = 'ysk_vlembedding_autostart'; gate = '零显存·无卡可选'; zero = $true; dflt = 'CPU'; cards = @('cpu') }
+    'vlrerank' = @{ n = '重排 18304';    full = 'vlreranker (纯CPU零显存, 平时按需点火)';                port = 18304; g = 'ysk_vlreranker_autostart'; gate = '零显存·无卡可选'; zero = $true; dflt = 'CPU'; cards = @('cpu') }
+}
+# mount order = the least elastic gate first (GPU1 big fixed seats -> GPU0 seats -> CPU trio -> suite)
+$BLOCK_ORDER_UP   = @('kvm', 'whisper', 'tele', 'tts', 'ocr', 'brain', 'vlembed', 'vlrerank', 'comfy')
+# unmount order = mirror (small first, the two engine-sized ones last)
+$BLOCK_ORDER_DOWN = @('tts', 'vlrerank', 'vlembed', 'brain', 'ocr', 'tele', 'whisper', 'comfy', 'kvm')
+$TRIO_BAT = @{
+    'brain'    = 'E:\DSDeployMaster\ysk_autostart\ysk_serve_brain.bat'
+    'vlembed'  = 'E:\DSDeployMaster\ysk_autostart\ysk_serve_vlembedding.bat'
+    'vlrerank' = 'E:\DSDeployMaster\ysk_autostart\ysk_serve_vlreranker.bat'
+}
+$TRIO_GUARD_RX = @{
+    'brain'    = 'ysk_serve_brain\.bat|ysk_task_brain\.vbs'
+    'vlembed'  = 'ysk_serve_vlembedding\.bat|ysk_task_vlembedding\.vbs'
+    'vlrerank' = 'ysk_serve_vlreranker\.bat|ysk_task_vlreranker\.vbs'
+}
+
+function Block-Status([string]$id) {
+    switch ($id) {
+        'tts' {
+            $h = TtsHealth
+            if (-not $h) { return 'off' }
+            if ($h.gpu.state -eq 'ready') { return 'gpu' }
+            return 'cpu'
+        }
+        'ocr'     { $m = OcrBuildMode; if ($m) { return $m }; return 'off' }
+        'tele'    { if (PortPid 18205)  { return 'gpu' } else { return 'off' } }
+        'whisper' { if (PortPid 9003)   { return 'gpu' } else { return 'off' } }
+        'kvm'     { if (PortPid 18200)  { return 'up' }  else { return 'off' } }
+        'comfy'   { if (PortPid 8188)   { return 'up' }  else { return 'off' } }
+        default   { if (PortPid $BLOCKS[$id].port) { return 'up' } else { return 'off' } }
+    }
+}
+function Guard-Status([string]$task) {
+    if (-not $task) { return 'none' }
+    $t = Get-TaskObj $task
+    if (-not $t) { return 'missing' }
+    if ($t.State -eq 'Disabled') { return 'off' }
+    return 'armed'
+}
+function Block-Alive([string]$id) { return (Block-Status $id) -ne 'off' }
+function Mount-Block([string]$id, [string]$Pick = 'auto') {
+    Note ("· 载入 " + $BLOCKS[$id].n + " (" + $BLOCKS[$id].full + ")" + $(if ($Pick -and $Pick -ne 'auto') { ' [指定 ' + $Pick + ']' } else { '' }))
+    switch ($id) {
+        'tts' {
+            if (-not (PortPid 9210)) {
+                Note "   9210 本体不在 -- 先 vbs 直起 ysk_serve_yosuko.bat 再挂 GPU 端点"
+                wscript //nologo $HID_VBS "E:\DSDeployMaster\ysk_autostart\ysk_serve_yosuko.bat" 2>&1 | Out-Null
+                for ($i = 0; $i -lt 60; $i++) { Start-Sleep -Seconds 5; if (TtsHealth) { break } }
+                if (-not (TtsHealth)) { Note "   !! 9210 5分钟没起 (CPU模型加载慢/查 yosuko_server.log), 本件跳过"; return }
+            }
+            ArmTtsGpu $Pick
+        }
+        'ocr'     { ArmOcrGpu $Pick }
+        'tele'    { ArmTeleocrGpu $Pick }
+        'whisper' { StartWhisper $Pick }
+        'kvm'     { ArmKvmemResident $Pick }
+        'comfy'   { StartComfyUI $Pick }
+        default {
+            $bat = $TRIO_BAT[$id]; $p = $BLOCKS[$id].port
+            if (-not (Test-Path $bat)) { Note ("   !! 缺启动脚本: " + $bat); return }
+            wscript //nologo $HID_VBS $bat 2>&1 | Out-Null
+            $ok = $false
+            for ($i = 0; $i -lt 48; $i++) { Start-Sleep -Seconds 5; if (PortPid $p) { $ok = $true; break } }
+            if ($ok) { Note ("   " + $BLOCKS[$id].n + " 已在岗 OK (零显存)") } else { Note ("   !! " + $BLOCKS[$id].n + " 4分钟未监听 -- 查对应 *_server.log") }
+        }
+    }
+}
+function Unhook-Block([string]$id) {
+    Note ("· 退出 " + $BLOCKS[$id].n)
+    switch ($id) {
+        'tts'     { StanddownTtsGpu }
+        'ocr'     { StanddownOcr }
+        'tele'    { StanddownTeleocr }
+        'whisper' { StopWhisper }
+        'kvm'     { CleanupKvmem }
+        'comfy'   { StopComfyUI }
+        default {
+            KillGuard $TRIO_GUARD_RX[$id]
+            KillService ($BLOCKS[$id].n) $BLOCKS[$id].port | Out-Null
+        }
+    }
+}
+function AssembleBlocks {
+    # spec comes from the -Arg queue (GUI single-shot: "tts=1,g.tts=0,...") or one Ask()
+    # line on the CLI; tokens absent from the spec keep the CURRENT live state, so an
+    # empty spec == "re-seat what is running now, change nothing".
+    $spec = ''
+    if ($global:RUN_ARGQ.Count -gt 0) { $spec = ($global:RUN_ARGQ -join ','); $global:RUN_ARGQ = @() }
+    if (-not $spec) { $spec = Ask "  积木清单 (留空=按当前状态; 例 tts=1,g.tts=1,comfy=0)" }
+    $want = @{}; $gwant = @{}; $picks = @{}
+    foreach ($tok in ("$spec" -split ',')) {
+        $tok = $tok.Trim(); if (-not $tok) { continue }
+        $kv = $tok -split '=', 2
+        if ($kv.Count -ne 2) { continue }
+        $k = $kv[0].Trim().ToLower(); $raw = $kv[1].Trim().ToLower()
+        if ($k.StartsWith('pick.')) { $picks[$k.Substring(5)] = $raw; continue }
+        $v = ($raw -in @('1','true','on'))
+        if ($k.StartsWith('g.')) { $gwant[$k.Substring(2)] = $v } else { $want[$k] = $v }
+    }
+    foreach ($id in $BLOCKS.Keys) {
+        if (-not $want.Contains($id)) { $want[$id] = [bool](Block-Alive $id) }
+        if (-not $gwant.Contains($id)) { $gwant[$id] = $null }
+    }
+    Note "=================== 开工装配 · 一键装配 ==================="
+    Note "GPU 起始:"; GpuReport
+    Note "--- 计划 ---"
+    foreach ($id in $BLOCK_ORDER_DOWN) { if (-not $want[$id]) { Note ("   退出 " + $BLOCKS[$id].n) } }
+    foreach ($id in $BLOCK_ORDER_UP)   { if ($want[$id])    { Note ("   载入 " + $BLOCKS[$id].n + "  [" + $(if ($picks.ContainsKey($id) -and $picks[$id] -ne 'auto') { '指定卡:' + $picks[$id] } else { '默认卡' }) + " · " + $BLOCKS[$id].gate + "]") } }
+    if ($want['comfy']) { Note "   ComfyUI 已勾选 -> 独吞 GPU0, 本轮跳过 Strata (真互斥, 不硬塞)" } else { Note "   最后拉起 Strata 8080 (已在岗则复用不重载)" }
+    foreach ($id in $BLOCKS.Keys) {
+        if ($null -ne $gwant[$id] -and $BLOCKS[$id].g) {
+            Note ("   守护 " + $BLOCKS[$id].g + " -> " + $(if ($gwant[$id]) { '启用' } else { '停用' }))
+        }
+    }
+    # 0) comfy vs strata are exclusive: evict Strata first (task stopped too, no respawn race)
+    if ($want['comfy'] -and (PortPid 8080)) {
+        Note "--- ComfyUI 勾选 -> 先请走 Strata (m>3 语义: 停 8080 进程树+守护) ---"
+        CleanupStrata
+    }
+    # 1) tear down the unchecked ones (small first, engine-sized last)
+    foreach ($id in $BLOCK_ORDER_DOWN) {
+        if ($want[$id]) { continue }
+        if (-not (Block-Alive $id)) { continue }
+        Unhook-Block $id
+    }
+    # 2) mount the checked ones in gate order; a live 9210 without its GPU endpoint gets the seat back
+    foreach ($id in $BLOCK_ORDER_UP) {
+        if (-not $want[$id]) { continue }
+        if (Block-Alive $id) {
+            if ($id -eq 'tts') {
+                $h = TtsHealth
+                if ($h -and $h.gpu.state -eq 'ready') { Note "   缘狐声线 GPU 端点已在岗 -- 复用"; continue }
+                Note "   9210 已在岗但 GPU 端点未挂 -- 尝试上卡"; ArmTtsGpu; continue
+            }
+            Note ("   " + $BLOCKS[$id].n + " 已在岗 -- 复用 (不重复点火)")
+            continue
+        }
+        $pkk = if ($picks.ContainsKey($id)) { $picks[$id] } else { 'auto' }
+        Mount-Block $id $pkk
+    }
+    # 3) Strata last -- its elastic split absorbs whatever seats the blocks kept
+    if ($want['comfy']) {
+        Note "   (ComfyUI 本轮当家, Strata 未启动; 要回主力按一级[1]或再装配一次)"
+    } elseif (PortPid 8080) {
+        Note "   Strata 已在岗 8080 -- 复用不重载 (装配只补小件, 不动主力)"
+    } else {
+        SwitchToStrata
+    }
+    # 4) guard tasks: plain-privilege writes first, everything ACL-refused goes to ONE
+    #    elevated helper at the very end (UAC at most once; it exits on its own)
+    $elev = @()
+    foreach ($id in $BLOCKS.Keys) {
+        if ($null -eq $gwant[$id]) { continue }
+        $task = $BLOCKS[$id].g; if (-not $task) { continue }
+        $armed = (Guard-Status $task) -eq 'armed'
+        if ($armed -eq $gwant[$id]) { Note ("   守护无需改动: " + $task); continue }
+        $flag = if ($gwant[$id]) { '/ENABLE' } else { '/DISABLE' }
+        & schtasks /Change /TN $task $flag 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Note ("   守护已" + $(if ($gwant[$id]) { '启用' } else { '停用' }) + ": " + $task)
+        } else {
+            Note ("   普通权限改不动 (任务ACL锁管理员), 归入集中提权: " + $task)
+            $elev += ('schtasks /Change /TN "' + $task + '" ' + $flag)
+        }
+    }
+    if ($elev.Count -gt 0) {
+        $tmp = Join-Path $env:TEMP ("ysk_guard_elev_" + (Get-Date -Format 'yymmdd_HHmmss') + ".ps1")
+        Set-Content -Path $tmp -Value ($elev -join "`r`n") -Encoding UTF8
+        Note ("--- 守护变更 " + $elev.Count + " 项: 现在弹一次 UAC, 提权助手跑完自行退出 ---")
+        try {
+            Start-Process pwsh -Verb RunAs -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$tmp)
+            Note "   提权执行完毕 (管理员进程已退出), 复查:"
+        } catch {
+            Note ("   !! UAC 被取消或提权失败, 守护改动未生效: " + $_.Exception.Message)
+        }
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+    }
+    foreach ($id in $BLOCKS.Keys) {
+        if ($null -eq $gwant[$id] -or -not $BLOCKS[$id].g) { continue }
+        Note ("   守护 " + $BLOCKS[$id].g + " 现状: " + (Guard-Status $BLOCKS[$id].g))
+    }
+    # 5) final state
+    Note "--- 终态 ---"
+    GpuReport
+    foreach ($id in $BLOCKS.Keys) {
+        $s = Block-Status $id
+        $tag = switch ($s) { 'gpu' { 'GPU在岗' } 'cpu' { 'CPU在岗' } 'up' { '在岗' } default { '离线' } }
+        Note ("   " + (Block-Line2 $id $tag))
+    }
+    Note ("   8080 http=" + (Http "GET" $S_URL $null 3) + "  18200 http=" + (Http "GET" $K_URL $null 3))
+    Note "=================== 装配完成 ==================="
+}
+# fast batched snapshot for the GUI probe (plain per-block polling cost ~14s, 261120):
+# ONE listen table + ONE scheduled-task enumeration + ONE tts health HTTP + at most ONE CIM
+# query (the OCR cmdline). Returns hashtable: id -> @{ st; gcur }, plus _gpu/_strata/_router.
+function Get-BlockSnapshot {
+    $ports = @{}
+    try { Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | ForEach-Object { $ports["$($_.LocalPort)"] = $_.OwningProcess } } catch { }
+    $tasks = @{}
+    try {
+        foreach ($t in (Get-ScheduledTask -TaskName "ysk_*" -ErrorAction SilentlyContinue)) {
+            $tasks[$t.TaskName.ToLower()] = $(if ($t.State -eq 'Disabled') { 'off' } else { 'armed' })
+        }
+    } catch { }
+    $h = $null
+    if ($ports.ContainsKey("9210")) { $h = TtsHealth }
+    $ocrMode = $null
+    if ($ports.ContainsKey("18201")) {
+        $opid = $ports["18201"]
+        $c = (Get-CimInstance Win32_Process -Filter "ProcessId=$opid" -ErrorAction SilentlyContinue).CommandLine
+        if ($c -and $c -match '-ngl\s+0(\s|$)') { $ocrMode = 'cpu' } else { $ocrMode = 'gpu' }
+    }
+    # physical card map: nvidia-smi says which GPU each compute pid holds (one shot)
+    $uu = @{}
+    foreach ($row in @(nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>$null)) {
+        $p = $row -split ',\s*'
+        if ($p.Count -ge 2) { $uu[$p[1].Trim()] = 'gpu' + $p[0].Trim() }
+    }
+    $pcard = @{}
+    foreach ($row in @(nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader 2>$null)) {
+        $p = $row -split ',\s*'
+        if ($p.Count -ge 2 -and $uu.ContainsKey($p[0].Trim())) { $pcard[$p[1].Trim()] = $uu[$p[0].Trim()] }
+    }
+    $r = @{}
+    foreach ($id in $BLOCKS.Keys) {
+        $b = $BLOCKS[$id]; $live = $ports.ContainsKey("$($b.port)")
+        $st = switch ($id) {
+            'tts'     { if (-not $live) { 'off' } elseif ($h -and $h.gpu.state -eq 'ready') { 'gpu' } else { 'cpu' } }
+            'ocr'     { if (-not $live) { 'off' } elseif ($ocrMode) { $ocrMode } else { 'off' } }
+            'tele'    { if ($live) { 'gpu' } else { 'off' } }
+            'whisper' { if ($live) { 'gpu' } else { 'off' } }
+            default   { if ($live) { 'up' }  else { 'off' } }
+        }
+        $gcur = 'none'
+        if ($b.g) {
+            $tn = $b.g.Split('\')[-1].ToLower()
+            $gcur = if ($tasks.ContainsKey($tn)) { $tasks[$tn] } else { 'missing' }
+        }
+        $card = $null
+        if ($live) {
+            # mode beats context-trails: a 'cpu'-mode host may still hold a tiny leftover CUDA
+            # context from a failed /gpu/load attempt (9210 gpu1 trail, 261120) -- trust mode.
+            if ($st -eq 'cpu' -or $b.zero) { $card = 'cpu' } else {
+                $apid = [string]$ports["$($b.port)"]
+                if ($pcard.ContainsKey($apid)) { $card = $pcard[$apid] }
+            }
+        }
+        $r[$id] = @{ st = $st; gcur = $gcur; card = $card }
+    }
+    $r['_gpu'] = @(nvidia-smi --query-gpu=index,memory.free,memory.total --format=csv,noheader,nounits 2>$null)
+    $r['_strata'] = $ports.ContainsKey('8080')
+    $r['_router'] = $ports.ContainsKey('18207')
+    return $r
+}
+function Block-Line2([string]$id, [string]$tag) {
+    $b = $BLOCKS[$id]
+    $gs = if ($b.g) { '  守护:' + (Guard-Status $b.g) } else { '  守护:无' }
+    return ("{0,-15} {1}{2}" -f $b.n, $tag, $gs)
+}
+function Show-BlocksState {
+    Note "=================== 积木现状快照 ==================="
+    Note "GPU:"; GpuReport
+    $snap = Get-BlockSnapshot
+    foreach ($id in $BLOCKS.Keys) {
+        $s = $snap[$id].st
+        $tag = switch ($s) { 'gpu' { 'GPU在岗' } 'cpu' { 'CPU在岗' } 'up' { '在岗' } default { '离线' } }
+        $b = $BLOCKS[$id]
+        $gs = if ($b.g) { '  守护:' + $snap[$id].gcur } else { '  守护:无' }
+        $cd = if ($snap[$id].card) { '  实坐:' + $snap[$id].card.ToUpper() } else { '' }
+        Note ("   " + ("{0,-15} {1}{2}{3}" -f $b.n, $tag, $gs, $cd))
+    }
+    $st = if (PortPid 8080) { 'Strata 在岗' } else { 'Strata 离线' }
+    Note ("   " + $st + "   18207网关: " + $(if (PortPid 18207) { '在岗' } else { '离线' }))
+    Note "=================================================="
+}
+function BlocksStatusLine {
+    $on = @($BLOCKS.Keys | Where-Object { Block-Alive $_ }).Count
+    $ar = @($BLOCKS.Keys | Where-Object { $BLOCKS[$_].g -and (Guard-Status $BLOCKS[$_].g) -eq 'armed' }).Count
+    $main = if (PortPid 8080) { 'Strata' } elseif (PortPid 18200) { 'KVMem' } else { '离线' }
+    Write-Host ("    积木在岗 " + $on + "/" + $BLOCKS.Count + "  ·  守护启用 " + $ar + "  ·  主力: " + $main)
 }
 
 # [h>8] scheduled task overview
@@ -2061,15 +2689,27 @@ function SystemStatusLine {
 
 # r = risk level for the GUI confirm dialog (danger | confirm | none); p = dialog spec
 # (text:... | radio:v=label|... | bak = dynamic rollback list via -ListBak); w = impact line.
+$MENU_B = [ordered]@{
+    '1' = @{ t = '一键装配 + 启动 Strata (勾选=在岗上卡, 不勾全退; 守护集中一次UAC)'; r = 'confirm'; w = '按门槛顺序落座(GPU1大件->GPU0->零显存), ComfyUI勾选则本轮不拉Strata; 全部守护改动集中在最后一次提权处理(弹一次UAC, 提权助手跑完自退)'; a = { AssembleBlocks } }
+    '2' = @{ t = '积木现状快照 (在岗/模式/守护 一览)';                                a = { Show-BlocksState } }
+    'q' = @{ t = '返回一级' }
+}
 $MENU_M = [ordered]@{
+    # display order = 装配优先度 (261120 master: most-likely-used first); keys/meaning unchanged
+    'a' = @{ t = '缘狐声线 上 GPU (9210 实时朗读提速; 需GPU0空闲≥8G)';      r = 'confirm'; w = '走服务自带 /gpu/load, 首次加载约1~3分钟; 不启用计划任务守护; 空闲超时会自动卸回 CPU'; a = { ArmTtsGpu } }
+    'b' = @{ t = '缘狐声线 下 GPU (让位显存, CPU端点仍常驻可读)';           a = { StanddownTtsGpu } }
+    '9' = @{ t = '小米OCR 18201 载入 GPU0 (GPU版 4~5s/页, 需GPU0空闲≥2300MB)'; r = 'confirm'; w = '会短停 18201 约1分钟重起为 GPU 版; GPU0 空隙不足会被 bat 自动转 CPU 版'; a = { ArmOcrGpu } }
+    '0' = @{ t = '小米OCR 18201 退出 (停守护+请走, 释放 GPU0 显存)';        r = 'confirm'; w = '退出后 OCR 只剩 18205 TeleOCR 或 VL 头兜底, 逐字转录精度会降'; a = { StanddownOcr } }
+    '8' = @{ t = 'KVMem 常驻点火·不动 Strata (双引擎并行, 守护常开)';      r = 'confirm'; a = { ArmKvmemResident } }
+    '4' = @{ t = 'KVMem 清洁退出 (只停 18200, 不动 Strata)';               r = 'confirm'; a = { CleanupKvmem } }
+    'c' = @{ t = 'TeleOCR 18205 上岗 (GPU1, 需空闲≥2048MB; 3~5s/页)';      r = 'confirm'; w = 'vbs 直起 serve_teleocr.bat, 不启用计划任务守护; 18207 网关会自动优先用它'; a = { ArmTeleocrGpu } }
+    'd' = @{ t = 'TeleOCR 18205 收回 (释放 GPU1)';                         r = 'confirm'; w = '先杀 serve 宿主防 30s 自愈回魂, 再请走实例'; a = { StanddownTeleocr } }
     '1' = @{ t = '创作工作站一键起 (KVMem+TeleOCR+ComfyUI@GPU0 全配套)';  r = 'confirm'; a = { CreativeWorkspace } }
     '2' = @{ t = '工作站拆除 (停 ComfyUI+18201+TeleOCR, 再 KVMem 退出)';   r = 'confirm'; a = { CleanupWorkspace } }
     '3' = @{ t = 'Strata 清洁退出 (停 8080 进程树与守护)';                 r = 'confirm'; a = { CleanupStrata } }
-    '4' = @{ t = 'KVMem 清洁退出 (只停 18200, 不动 Strata)';               r = 'confirm'; a = { CleanupKvmem } }
-    '5' = @{ t = 'Ollama 卸载 (keep_alive=0 释放显存)';                    a = { FreeOllama } }
     '6' = @{ t = 'TeleCPU 应急拉起 (18205慢速应急, 主力仍是18201小米)';    a = { StartOcrCpu } }
     '7' = @{ t = 'TeleCPU 应急收回 (单独态勿按, 会误杀TeleGPU主力)';       r = 'confirm'; a = { StopOcrCpu } }
-    '8' = @{ t = 'KVMem 常驻点火·不动 Strata (双引擎并行, 守护常开)';      r = 'confirm'; a = { ArmKvmemResident } }
+    '5' = @{ t = 'Ollama 卸载 (keep_alive=0 释放显存)';                    a = { FreeOllama } }
     'q' = @{ t = '返回一级' }
 }
 $MENU_U = [ordered]@{
@@ -2108,13 +2748,15 @@ $MENU_H = [ordered]@{
     'q' = @{ t = '返回一级' }
 }
 $MENU_GROUPS = [ordered]@{
+    'b' = @{ title = '开工装配';       items = $MENU_B; head = { BlocksStatusLine } }
     'm' = @{ title = '模型与显存';     items = $MENU_M; head = { StatusLine } }
     'u' = @{ title = '引擎与升级';     items = $MENU_U; head = { EngineVerLine } }
     'c' = @{ title = '创作与救护';     items = $MENU_C; head = { CreateStatusLine } }
     'h' = @{ title = 'Hermes 与系统';  items = $MENU_H; head = { SystemStatusLine } }
 }
 $MENU_MAIN = [ordered]@{
-    '1' = @{ t = '切换主力 -> Strata (125B 双卡常驻; 退ComfyUI不误伤KVMem)'; r = 'danger'; w = '会请走 ComfyUI 等 GPU 套件 (KVMem 常驻备胎不动), Strata 冷加载3~5分钟, 收尾自动回挂 18201+TeleOCR 守护'; a = { SwitchToStrata } }
+    'b' = @{ t = '开工装配 (积木一键装配: 勾选在岗上卡, 不勾退出, 然后拉 Strata)'; grp = 'b' }
+    '1' = @{ t = '切换主力 -> Strata (125B 双卡常驻; 退ComfyUI不误伤KVMem/18201)'; r = 'danger'; w = '会请走 ComfyUI 等 GPU 套件 (KVMem 常驻备胎不动); 小米OCR 18201 一律不清除 (CPU版零显存; GPU版共存实测中, 请走动作已注号停用); Strata 冷加载3~5分钟'; a = { SwitchToStrata } }
     '2' = @{ t = '切换主力 -> KVMem 创作协同 (GPU1 约16G, GPU0 整卡留给出图)'; r = 'danger'; w = 'Strata 将退出 (正在跑的对话会断开), 18201 转 CPU 版, TeleOCR 上岗'; a = { SwitchToKvmem } }
     '3' = @{ t = '一键服务体检 (全端口 + 显存 + 磁盘 + 引擎版本)';           a = { FullHealth } }
     '4' = @{ t = 'GPU 进程明细 (谁在占显存, 排障第一步)';                    a = { GpuProcs } }
@@ -2211,13 +2853,32 @@ if ($DumpMenu) {
     exit 0
 }
 if ($ListBak) { ConvertTo-Json -InputObject @(List-StrataBakItems) -Depth 3 -Compress; exit 0 }
+# assembly-desk probe for the GUI first tab: one JSON line, no banner noise.
+# st: off|cpu|gpu|up | gcur: none|off|armed|missing | display order = $BLOCKS order = assembly priority.
+if ($BlocksState) {
+    $s = Get-BlockSnapshot
+    $o = [ordered]@{
+        gpu    = @($s['_gpu'])
+        strata = [ordered]@{ alive = [bool]$s['_strata']; http = $(if ($s['_strata']) { 200 } else { 0 }) }
+        router = [bool]$s['_router']
+        blocks = @(foreach ($id in $BLOCKS.Keys) {
+            $b = $BLOCKS[$id]
+            [pscustomobject]@{ id = $id; n = $b.n; full = $b.full; port = $b.port
+                st = $s[$id].st; zero = [bool]$b.zero; gate = $b.gate
+                g = $b.g; gcur = $s[$id].gcur; card = $s[$id].card
+                dflt = $b.dflt; cards = $b.cards }
+        } )
+    }
+    ConvertTo-Json -InputObject $o -Depth 4 -Compress
+    exit 0
+}
 # single-shot item run for the GUI: -Run 'u>8' or -Run '3'; args feed the Ask() queue.
 if ($Run) {
     $key = "$Run".Trim().ToLower()
     $global:RUN_ARGQ = @("$Arg" -split ',' | ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne '' })
     if ($key -eq 'q') { exit 0 }
     $act = $null
-    if ($key -match '^([much])>([0-9a-z]+)$') {
+    if ($key -match '^([bmuch])>([0-9a-z]+)$') {
         $gg = $MENU_GROUPS[$Matches[1]]
         if ($gg) { $act = $gg.items[$Matches[2]].a }
     } elseif ($MENU_MAIN[$key]) {
