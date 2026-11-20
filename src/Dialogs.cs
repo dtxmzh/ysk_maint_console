@@ -27,8 +27,8 @@ public static class Dialogs
         var ok = Button(danger ? "确认执行" : "执行", danger ? Danger : BtnBg);
         var no = Button("取消", BtnBg);
         ok.IsDefault = true; no.IsCancel = true;
-        ok.Click += (_, _) => { win.DialogResult = true; };
-        no.Click += (_, _) => { win.DialogResult = false; };
+        Arm(ok, () => { win.DialogResult = true; });
+        Arm(no, () => { win.DialogResult = false; });
         panel.Children.Add(Buttons(ok, no));
         return win.ShowDialog() == true;
     }
@@ -58,13 +58,13 @@ public static class Dialogs
         string? result = null;
         var go = Button("执行", BtnBg); var no = Button("取消", BtnBg);
         go.IsDefault = true; no.IsCancel = true;
-        go.Click += (_, _) =>
+        Arm(go, () =>
         {
             foreach (var rb in radios)
                 if (rb.IsChecked == true) { result = (string)rb.Tag!; break; }
             win.DialogResult = result != null;
-        };
-        no.Click += (_, _) => { win.DialogResult = false; };
+        });
+        Arm(no, () => { win.DialogResult = false; });
         panel.Children.Add(Buttons(go, no));
         win.ShowDialog();
         return result;
@@ -86,15 +86,33 @@ public static class Dialogs
         string? result = null;
         var go = Button("确定", BtnBg); var no = Button("取消", BtnBg);
         go.IsDefault = true; no.IsCancel = true;
-        go.Click += (_, _) => { result = tb.Text.Trim(); win.DialogResult = true; };
-        no.Click += (_, _) => { win.DialogResult = false; };
+        Arm(go, () => { result = tb.Text.Trim(); win.DialogResult = true; });
+        Arm(no, () => { win.DialogResult = false; });
         panel.Children.Add(Buttons(go, no));
-        win.Loaded += (_, _) => { tb.Focus(); };
+        win.Loaded += (_, _) => { try { win.Activate(); tb.Focus(); } catch { } };
         win.ShowDialog();
         return result;
     }
 
     // ---- helpers ----
+
+    /// <summary>Wire a dialog button for BOTH paths (master 261120 bug report: with a plain
+    /// Click handler a mouse press that only re-activates the dialog swallows the first
+    /// click, while Enter (IsDefault) still works). PreviewMouseLeftButtonDown fires the
+    /// action the instant the press lands, Click keeps the keyboard path, and a re-entry
+    /// guard makes the double-firing harmless.</summary>
+    private static void Arm(Button b, Action act)
+    {
+        bool done = false;
+        void Run()
+        {
+            if (done) return;
+            done = true;
+            act();
+        }
+        b.PreviewMouseLeftButtonDown += (_, e) => { e.Handled = true; Run(); };
+        b.Click += (_, _) => Run();
+    }
 
     private static (Window, StackPanel) NewWindow(Window owner, string title, double width)
     {
@@ -121,6 +139,9 @@ public static class Dialogs
             FontFamily = owner.FontFamily,
             WindowStyle = WindowStyle.SingleBorderWindow,
         };
+        // belt & suspenders: make sure the dialog really owns the foreground, so the first
+        // mouse press on a button is never spent on window activation (master 261120 report)
+        win.Loaded += (_, _) => { try { win.Activate(); } catch { } };
         return (win, panel);
     }
 

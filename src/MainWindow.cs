@@ -88,12 +88,24 @@ public sealed class MainWindow : Window
         _term.AttachLog(Path.Combine(cfg.ExeDir, "_data", "ysk_maint_console.log"));
 
         Title = "维护操作台";
-        // master 261120: start at a fixed comfortable 800x600 (DIP ~ px at 100% scaling);
-        // the layout itself is fully stretchable, so pulling the window bigger just works.
-        Width = 800; Height = 600; MinWidth = 780; MinHeight = 560;
+        // master 261120 #2: remember the size/position from the last run (saved on close into
+        // _data\ysk_win_layout.ini); fall back to the fixed comfortable 800x600 centered.
+        // The layout itself is fully stretchable, so pulling the window bigger just works.
+        var lay = WinLayout.Load(cfg.ExeDir);
+        if (lay != null)
+        {
+            Left = lay.Left; Top = lay.Top; Width = lay.Width; Height = lay.Height;
+            WindowStartupLocation = WindowStartupLocation.Manual;
+            if (lay.Maximized) WindowState = WindowState.Maximized;
+        }
+        else
+        {
+            Width = 800; Height = 600;
+            WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        }
+        MinWidth = 780; MinHeight = 560;
         Background = Bg; Foreground = Fg;
         FontFamily = new FontFamily(UiFont); FontSize = 13;
-        WindowStartupLocation = WindowStartupLocation.CenterScreen;
         TryLoadIcon();
 
         try { Application.Current.DispatcherUnhandledException += OnUnhandled; } catch { }
@@ -204,10 +216,16 @@ public sealed class MainWindow : Window
         btnExport.Click += OnExport;
         var btnClear = MkBtn("清屏");
         btnClear.Click += (_, _) => { _term.ClearAll(); _term.AppendNote("已清屏（磁盘同步日志仍保留全部历史）"); };
+        // master 261120 #2: undo remembered geometry -> back to 800x600 centered, and forget
+        // the remembered layout so the next launch also starts from the default.
+        var btnResetWin = MkBtn("恢复窗口");
+        ToolTipService.SetToolTip(btnResetWin, "把窗口恢复为默认 800x600 并居中，同时清除记住的位置（下次启动也从默认开始）");
+        btnResetWin.Click += (_, _) => ResetWindowGeometry();
         sp.Children.Add(_btnKill);
         sp.Children.Add(btnCopy);
         sp.Children.Add(btnExport);
         sp.Children.Add(btnClear);
+        sp.Children.Add(btnResetWin);
 
         // progress strip (master 261120): indeterminate glide while running, solid result fill after
         _bar = new ProgressBar
@@ -613,6 +631,19 @@ public sealed class MainWindow : Window
         }
     }
 
+    /// <summary>Revert to the built-in window layout (800x600 centered on the virtual screen)
+    /// and forget the remembered one, so the next launch starts fresh too.</summary>
+    private void ResetWindowGeometry()
+    {
+        WinLayout.Clear(_cfg.ExeDir);
+        WindowState = WindowState.Normal;
+        Width = WinLayout.DefaultWidth; Height = WinLayout.DefaultHeight;
+        Left = SystemParameters.VirtualScreenLeft + (SystemParameters.VirtualScreenWidth - Width) / 2;
+        Top = SystemParameters.VirtualScreenTop + (SystemParameters.VirtualScreenHeight - Height) / 2;
+        try { WinLayout.Of(this).Save(_cfg.ExeDir); } catch { }  // default persists right away
+        _term.AppendNote("窗口已恢复默认 800x600 并居中（位置记忆已清除）");
+    }
+
     private void OnClosing(object? sender, CancelEventArgs e)
     {
         if (_activeCount > 0 && !_quitting)
@@ -621,6 +652,7 @@ public sealed class MainWindow : Window
             { e.Cancel = true; return; }
         }
         _quitting = true;
+        try { WinLayout.Of(this).Save(_cfg.ExeDir); } catch { }   // remember geometry for next launch
         _statusTimer.Stop();
         _uiTimer.Stop();
         _state.Dispose();

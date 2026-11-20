@@ -1690,7 +1690,22 @@ function StrataUpgrade {
     }
     # build: prefer the repo's existing build-<slug>-ysk.bat; else template from build-v0216-ysk.bat
     # (measured V100 recipe in the 0.2.16 NEW layout: engine lives in engine\, vision in terminal\tools\vision),
-    # only swap -B dir. Old top-level-layout templates were retired at the 261120 cutover.
+    #   only swap -B dir. Old top-level-layout templates were retired at the 261120 cutover.
+    # 261120 lesson #2: the venv moved into terminal\ at that cutover, and pip's cmake console-shim
+    #   in Scripts\ still carries the OLD absolute python path -- it now dies with rc=1 and ZERO
+    #   output (the failed [u>1] 'path not found' burn). Always normalize bat tool paths to the
+    #   probed runnable ones: real cmake under site-packages\cmake\data\bin, ninja is a plain
+    #   binary in Scripts (survives relocation), and probe both venv locations.
+    $venvScr = if (Test-Path "$S_DIR\terminal\.venv\Scripts\ninja.exe") { "$S_DIR\terminal\.venv\Scripts" } else { "$S_DIR\.venv\Scripts" }
+    $cmkReal = (Split-Path $venvScr -Parent) + "\Lib\site-packages\cmake\data\bin\cmake.exe"
+    if (-not (Test-Path $cmkReal)) { $cmkReal = "$venvScr\cmake.exe" }
+    function Normalize-BuildBat([string]$path) {
+        # rewrite every cmake.exe / CMAKE_MAKE_PROGRAM ninja.exe absolute path to the probed live tools
+        $t = [IO.File]::ReadAllText($path, [Text.Encoding]::GetEncoding(28591))
+        $t2 = $t -replace '[A-Za-z]:\\[^\s"]*?\\cmake\.exe', $cmkReal
+        $t2 = $t2 -replace '(-DCMAKE_MAKE_PROGRAM=)[A-Za-z]:\\[^\s"]*?\\ninja\.exe', ('$1' + "$venvScr\ninja.exe")
+        if ($t2 -ne $t) { [IO.File]::WriteAllText($path, $t2, [Text.Encoding]::GetEncoding(28591)); Note "   已校正构建配方工具路径 (cmake=$cmkReal)" }
+    }
     $slug = $sel -replace '[^0-9A-Za-z]', ''
     $bEng = "build-" + $slug; $bVis = "build-vision-" + $slug
     $tplEng = "$S_DIR\build-v0216-ysk.bat"; $tplVis = "$S_DIR\build-vision-v0216-ysk.bat"
@@ -1709,6 +1724,8 @@ function StrataUpgrade {
         [IO.File]::WriteAllText($visBat, ($raw -replace 'build-vision-v0216', $bVis), [Text.Encoding]::GetEncoding(28591))
         Note "   已生成 build-vision-$slug-ysk.bat"
     } else { $visBat = $null }
+    Normalize-BuildBat $engBat
+    if ($visBat) { Normalize-BuildBat $visBat }
     # ggml source check (261112 fix: $raw only had a value in the 'generate bat from template' branch,
     #   staying empty when a repo bat already exists -> always fell back to the 3cf03257 old tree; but since
     #   0.2.13 the official repo vendors ggml under third_party\strata-ggml -- forcing the old pin tree compiles a new engine against old ggml)
