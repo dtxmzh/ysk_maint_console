@@ -221,8 +221,9 @@ public sealed class BlocksPanel
                 {
                     Width = 74, FontSize = 11.5, Margin = new Thickness(4, 0, 4, 0),
                     Background = BtnBg, Foreground = Fg, BorderBrush = Line,
+                    Style = ComboSkin.Combo, ItemContainerStyle = ComboSkin.Item,
                     VerticalAlignment = VerticalAlignment.Center,
-                    ToolTip = "载入到哪张卡: 自动 = 该件内置默认 (" + b.Dflt + ")；改卡需先退出再装配",
+                    ToolTip = "载入到哪张卡: 自动 = 该件内置默认 (" + b.Dflt + ")；改卡会自动退出重拉起",
                 };
                 foreach (var c in b.Cards) row.Pick.Items.Add(CardLabel.GetValueOrDefault(c, c));
                 row.Pick.SelectionChanged += (_, _) =>

@@ -9,7 +9,7 @@
     <AssemblyName>ysk_maint_console</AssemblyName>
     <RootNamespace>MaintOps</RootNamespace>
     <ApplicationIcon>app.ico</ApplicationIcon>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
     <Product>维护操作台</Product>
     <Company>Yosuko</Company>
     <Description>「维护操作台」—— 本机维护脚本 (ysk_maint_console.ps1) 的窗口前端：分组菜单树 + 单发执行引擎 + 可复制可导出的彩色终端回显。</Description>

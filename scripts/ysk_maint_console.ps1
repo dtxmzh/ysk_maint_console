@@ -1231,10 +1231,16 @@ function Block-Status([string]$id) {
 }
 function Guard-Status([string]$task) {
     if (-not $task) { return 'none' }
-    $t = Get-TaskObj $task
-    if (-not $t) { return 'missing' }
-    if ($t.State -eq 'Disabled') { return 'off' }
-    return 'armed'
+    # authoritative source = schtasks itself, anchored on the 计划任务状态 line. Two traps
+    # proven 261120: ① Get-ScheduledTask .State comes from CIM and LAGS writes by seconds
+    # (the false 'armed' master saw right after real disables); ② plain /Query LIST shows no
+    # enable/disable state at all, and /V has four OTHER '已禁用' setting lines -- so match
+    # ONLY '计划任务状态:/Scheduled Task State:' plus the value on that same line.
+    $o = (& schtasks /Query /TN $task /V /FO LIST 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) { return 'missing' }
+    if ($o -match '(计划任务状态|Scheduled Task State):\s*(已禁用|Disabled)') { return 'off' }
+    if ($o -match '(计划任务状态|Scheduled Task State):\s*(已启用|Enabled)')  { return 'armed' }
+    return 'missing'
 }
 function Block-Alive([string]$id) { return (Block-Status $id) -ne 'off' }
 function Mount-Block([string]$id, [string]$Pick = 'auto') {
@@ -1302,13 +1308,53 @@ function AssembleBlocks {
     }
     Note "=================== 开工装配 · 一键装配 ==================="
     Note "GPU 起始:"; GpuReport
-    Note "--- 计划 ---"
+    # live physical seats (one nvidia-smi pair) so a changed card pick can be detected and
+    # relocated: 261120 master's rule = '选卡不同了就退出重拉起', no silent reuse.
+    $uu0 = @{}
+    foreach ($row in @(nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>$null)) {
+        $p = $row -split ',\s*'
+        if ($p.Count -ge 2) { $uu0[$p[1].Trim()] = 'gpu' + $p[0].Trim() }
+    }
+    $pc0 = @{}
+    foreach ($row in @(nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader 2>$null)) {
+        $p = $row -split ',\s*'
+        if ($p.Count -ge 2 -and $uu0.ContainsKey($p[0].Trim())) { $pc0[$p[1].Trim()] = $uu0[$p[0].Trim()] }
+    }
+    $moves = @()
+    foreach ($id in $BLOCK_ORDER_UP) {
+        if (-not $want[$id]) { continue }
+        if (-not (Block-Alive $id)) { continue }
+        $p2 = if ($picks.ContainsKey($id)) { $picks[$id] } else { 'auto' }
+        if ($p2 -notin @('gpu0','gpu1','cpu')) { continue }
+        if ($BLOCKS[$id].zero) { continue }
+        # tts with GPU endpoint unmounted (cpu mode) + a gpu pick = normal arming, not a move
+        if ($id -eq 'tts' -and (Block-Status 'tts') -eq 'cpu') { continue }
+        $cur = $null
+        $plm = PortPid $BLOCKS[$id].port
+        if ($plm) { $cur = $pc0[[string]$plm] }
+        if (-not $cur) { $cur = 'cpu' }
+        if ($cur -ne $p2) { $moves += ,@($id, $cur, $p2) }
+    }
     foreach ($id in $BLOCK_ORDER_DOWN) { if (-not $want[$id]) { Note ("   退出 " + $BLOCKS[$id].n) } }
     foreach ($id in $BLOCK_ORDER_UP)   { if ($want[$id])    { Note ("   载入 " + $BLOCKS[$id].n + "  [" + $(if ($picks.ContainsKey($id) -and $picks[$id] -ne 'auto') { '指定卡:' + $picks[$id] } else { '默认卡' }) + " · " + $BLOCKS[$id].gate + "]") } }
+    foreach ($m in $moves) { Note ("   换卡: " + $BLOCKS[$m[0]].n + "  " + $m[1] + " -> " + $m[2] + " (退出重拉起)") }
     if ($want['comfy']) { Note "   ComfyUI 已勾选 -> 独吞 GPU0, 本轮跳过 Strata (真互斥, 不硬塞)" } else { Note "   最后拉起 Strata 8080 (已在岗则复用不重载)" }
     foreach ($id in $BLOCKS.Keys) {
         if ($null -ne $gwant[$id] -and $BLOCKS[$id].g) {
             Note ("   守护 " + $BLOCKS[$id].g + " -> " + $(if ($gwant[$id]) { '启用' } else { '停用' }))
+        }
+    }
+    # 0.4) cross-card moves need the target seat at load time: a LIVE Strata never yields a
+    #   card (its elastic split only re-solves on cold load), so step it out of the way first
+    #   when any move wants a GPU seat and that seat currently looks tight.
+    $GATE_MIB = @{ tts = 8192; ocr = 2300; tele = 2048; whisper = 6144; kvm = 14800; comfy = 8000 }
+    foreach ($m in $moves) {
+        if ($m[2] -notin @('gpu0','gpu1')) { continue }
+        $gi = [int]$m[2].Substring(3)
+        if ((GpuFreeMib $gi) -lt $GATE_MIB[$m[0]] -and (PortPid 8080)) {
+            Note "--- 换卡落座需要空隙, 目标卡被在岗 Strata 占着 -- 先清退 Strata (m>3 语义), 落完小件最后再冷加载回来 ==="
+            CleanupStrata
+            break
         }
     }
     # 0) comfy vs strata are exclusive: evict Strata first (task stopped too, no respawn race)
@@ -1325,6 +1371,13 @@ function AssembleBlocks {
     # 2) mount the checked ones in gate order; a live 9210 without its GPU endpoint gets the seat back
     foreach ($id in $BLOCK_ORDER_UP) {
         if (-not $want[$id]) { continue }
+        if ($moves | Where-Object { $_[0] -eq $id }) {
+            Note ("   " + $BLOCKS[$id].n + " 换卡重落 (先请走现实例)")
+            Unhook-Block $id
+            $pkk2 = if ($picks.ContainsKey($id)) { $picks[$id] } else { 'auto' }
+            Mount-Block $id $pkk2
+            continue
+        }
         if (Block-Alive $id) {
             if ($id -eq 'tts') {
                 $h = TtsHealth
