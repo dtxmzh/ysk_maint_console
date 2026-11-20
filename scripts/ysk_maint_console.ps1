@@ -311,7 +311,7 @@ function KillStrata() {
 # ---------------------------------------------------------------------------
 # [1] switch main model -> Strata
 # ---------------------------------------------------------------------------
-function SwitchToStrata {
+function SwitchToStrata([bool]$ReArmOcr = $true, [bool]$ReArmTele = $true) {
     Note "=================== Strata 切换开始 ==================="
     Note "GPU 起始:"; GpuReport
 
@@ -368,7 +368,9 @@ function SwitchToStrata {
     # (old 300s idle wait removed, dual-engine state needs OCR always available).
     # Also re-arm TeleOCR 18205 guard (GPU-side ONLY head; its bat waits while GPU1 tight,
     # mounts in single-engine states). Router 18207 auto-prefers 18205 when it is up.
-    if (PortPid 18201) {
+    if (-not $ReArmOcr) {
+        Note "   (本装配未勾选小米OCR -- 尊重勾选不回挂)"
+    } elseif (PortPid 18201) {
         Note ("   小米OCR 18201 在岗未动 (" + (OcrBuildMode) + " 模式) -- 无需回挂")
     } else {
         Note "--- Strata 就绪后自动回挂 18201 小米 (双模式bat按显存自适应 GPU/CPU) ---"
@@ -388,7 +390,13 @@ function SwitchToStrata {
         }
         if (PortPid 18201) { Note ("   18201 已回挂 OK (" + (OcrBuildMode) + " 模式)") } else { Note "   18201 未即时起(权重加载中), 守护/vbs 会自行再来, 不影响Strata" }
     }
-    if (-not (PortPid 18205)) {
+    # 261121 lesson: this legacy re-arm ignored the assembly's checkboxes and schtasks /Run
+    #   fired the DISABLED task's loop host anyway -- the host then auto-mounted teleOCR on
+    #   GPU1 and stole the voice line's seat. Assembly passes its own will; [1] keeps old
+    #   auto-preference behaviour (defaults stay true).
+    if (-not $ReArmTele) {
+        Note "   (本装配未勾选 TeleOCR -- 尊重勾选，不再自动回挂/点火)"
+    } elseif (-not (PortPid 18205)) {
         Note "--- 回挂 TeleOCR 守护 (18205, GPU1 有座时自动上岗; 双引擎态罚站属正常) ---"
         TaskRun $TASK_TL
     }
@@ -1460,7 +1468,7 @@ function AssembleBlocks {
     } elseif (PortPid 8080) {
         Note "   Strata 已在岗 8080 -- 复用不重载 (装配只补小件, 不动主力)"
     } else {
-        SwitchToStrata
+        SwitchToStrata -ReArmOcr:([bool]$want['ocr']) -ReArmTele:([bool]$want['tele'])
     }
     # 4) guard tasks: plain-privilege writes first, everything ACL-refused goes to ONE
     #    elevated helper at the very end (UAC at most once; it exits on its own)
@@ -1504,6 +1512,19 @@ function AssembleBlocks {
         Note ("   " + (Block-Line2 $id $tag))
     }
     Note ("   8080 http=" + (Http "GET" $S_URL $null 3) + "  18200 http=" + (Http "GET" $K_URL $null 3))
+    # 5) late sweep: any legacy/auto path that re-fired a disabled guard's LOOP HOST during
+    #    this run (teleocr/whisper/ocr bats self-heal and happily take a free seat) gets put
+    #    back in the box -- unchecked means unchecked, no resurrection after the fact.
+    foreach ($id in $BLOCK_ORDER_DOWN) {
+        if ($want[$id]) { continue }
+        if (Block-Alive $id) {
+            Note ("   迟到复活清退: " + $BLOCKS[$id].n)
+            Unhook-Block $id
+        }
+    }
+    if (-not $want['tele']) { KillGuard "ysk_serve_teleocr|ysk_task_teleocr|ysk_run_hidden\.vbs.*teleocr" }
+    if (-not $want['whisper']) { KillGuard "task_whisper\.vbs|whisper-asr.*start\.bat|ysk_serve_whisper" }
+    if (-not $want['ocr']) { KillGuard "ysk_serve_ocr\.bat|ysk_task_ocr\.vbs|ysk_run_hidden\.vbs.*ysk_serve_ocr" }
     Note "=================== 装配完成 ==================="
 }
 # fast batched snapshot for the GUI probe (plain per-block polling cost ~14s, 261120):
