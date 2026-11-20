@@ -100,6 +100,8 @@ $TASK_R   = "\ysk\ysk_vision_router_guard"   # 11-18 fix: \ysk\ prefix; 10-25: v
 # for the TeleOCR-CPU emergency instance (manual-only, launched via hidden vbs):
 $TL_CPU_BAT = "E:\DSDeployMaster\ysk_autostart\ysk_run_teleocr_cpu.bat"
 $HID_VBS    = "E:\DSDeployMaster\ysk_autostart\ysk_run_hidden.vbs"
+$TASK_TTS   = "ysk_yosuko_autostart"   # voice line guard task (block policy default disarmed)
+$TTS_BAT    = "E:\DSDeployMaster\ysk_autostart\ysk_serve_yosuko.bat"   # 9210 serve+30s loop; env YSK_GPU pins the CUDA card view (261120)
 $TASK_B   = "ysk_brain_autostart"   # dispatcher 18202 (command approval)
 $TASK_VLE = "ysk_vlembedding_autostart"   # embed 18303
 $TASK_VLR = "ysk_vlreranker_autostart"   # rerank 18304
@@ -886,6 +888,8 @@ function StartWhisper([string]$Pick = 'auto') {
 # [c>6] whisper ASR down
 function StopWhisper {
     Note "--- whisper ASR 关闭 ---"
+    TaskStop "ysk_whisper_autostart"
+    KillGuard "task_whisper\.vbs|whisper-asr.*start\.bat|ysk_serve_whisper"
     KillService "whisper-asr" 9003 | Out-Null
 }
 
@@ -1013,7 +1017,9 @@ function ArmOcrGpu([string]$Pick = 'auto') {
 function StanddownOcr {
     Note "=================== 小米OCR 18201 退出 (释放显存) ==================="
     if (-not (PortPid 18201)) {
-        Note "   18201 本来就没在监听 -- 无事可做 (要上岗按 m>9)"
+        TaskStop $TASK_OCR
+        KillGuard "ysk_serve_ocr\.bat|ysk_task_ocr\.vbs|ysk_run_hidden\.vbs.*ysk_serve_ocr"
+        Note "   18201 没在监听 -- 顺手清循环宿主防复活 (要上岗按 m>9)"
         return
     }
     $mode = OcrBuildMode
@@ -1040,6 +1046,20 @@ function StanddownOcr {
 # failure (bad args / bad config / no VRAM seat) it replays the same crash forever and the
 # human has to kill it anyway. Ignition always goes through the hidden-vbs launcher.
 # ---------------------------------------------------------------------------
+# which PHYSICAL gpu a live pid actually holds (nvidia-smi compute-apps, null = no VRAM seat)
+function Gpu-Of-Pid([int]$procId) {
+    if (-not $procId) { return $null }
+    $uuT = @{}
+    foreach ($row in @(nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>$null)) {
+        $p = $row -split ',\s*'
+        if ($p.Count -ge 2) { $uuT[$p[1].Trim()] = 'gpu' + $p[0].Trim() }
+    }
+    foreach ($row in @(nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader 2>$null)) {
+        $p = $row -split ',\s*'
+        if ($p.Count -ge 2 -and $p[1].Trim() -eq [string]$procId -and $uuT.ContainsKey($p[0].Trim())) { return $uuT[$p[0].Trim()] }
+    }
+    return $null
+}
 function TtsHealth {
     try { return ((Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 "$T_URL/health").Content | ConvertFrom-Json) } catch { return $null }
 }
@@ -1047,38 +1067,73 @@ function TtsHealth {
 #   GPU_MIN_FREE_GIB (env YOSUKO_GPU_MIN_GIB, default 8G on GPU0). Load it while Strata is
 #   still off the card: the precheck only runs at load time, a live endpoint never yields.
 function ArmTtsGpu([string]$Pick = 'auto') {
-    # card pick: auto/gpu0 -> server default (env YOSUKO_GPU_DEVICE, today GPU0); gpu1 via
-    # /gpu/load?device=1 (needs the 261120 server.py running -- a pre-restart 9210 ignores the
-    # query param and lands on GPU0, which we report honestly); cpu = keep endpoint unloaded.
-    $pk = switch ($Pick) { 'gpu1' { '1' } default { '0' } }
-    $pkName = switch ($Pick) { 'gpu1' { 'GPU1' } default { 'GPU0' } }
+    # 261120 third live-fire round: IndexTTS spreads weights over EVERY visible GPU (8G@GPU0 +
+    # 1.1G@GPU1 trail proven on master's box), so picking a SPECIFIC card means ONE cold restart
+    # of 9210 with CUDA_VISIBLE_DEVICES single-card view (serve bat honors env YSK_GPU). Only
+    # 'auto' keeps the cheap hot /gpu/load path on the server default card. cpu = endpoint off.
     if ($Pick -eq 'cpu') {
         Note "=================== 缘狐声线 CPU 选择: GPU 端点不挂 (CPU 主路常驻, 朗读不断) ==================="
         StanddownTtsGpu
         return
     }
-    Note ("=================== 缘狐声线 上 GPU · 指定卡 " + $pkName + " (9210 实时朗读提速) ===================")
+    $pk = switch ($Pick) { 'gpu1' { '1' } 'gpu0' { '0' } default { '' } }
+    $pkName = if ($pk -eq '') { '服务默认卡(今天GPU0)' } else { 'GPU' + $pk }
+    Note ("=================== 缘狐声线 上 GPU · " + $pkName + " (9210 实时朗读提速) ===================")
     $h = TtsHealth
     if (-not $h) {
-        Note "   !! 9210 没在回答 -- 先起 yosuko-tts 本体 (计划任务 ysk_yosuko_autostart 已在位), 再按本项"
+        Note "   !! 9210 没在回答 -- 先起 yosuko-tts 本体 (vbs 直起 serve_yosuko.bat 或任务 ysk_yosuko_autostart), 再按本项"
         return
     }
-    Note ("   门槛: GPU0 空闲需 >= " + $h.gpu.min_free_gib + "G | 当前 " + $h.gpu.free_now_gib + "G | gpu.state=" + $h.gpu.state)
+    $seat = Gpu-Of-Pid (PortPid 9210)
     if ($h.gpu.state -eq 'ready') {
-        Note ("   GPU 端点已在岗 ready (上次加载 " + $h.gpu.last_load_sec + "s) -- 无需再动, 合成已自动走 GPU")
-        return
+        if ($pk -eq '' -or $seat -eq ('gpu' + $pk)) {
+            Note ("   GPU 端点已在岗就绪 (实坐 " + $(if ($seat) { $seat.ToUpper() } else { '?' }) + ") -- 无需再动")
+            return
+        }
+        Note ("   端点实坐 " + $(if ($seat) { $seat.ToUpper() } else { '?' }) + " ≠ " + $pkName + " -- 走单卡视野冷重启")
     }
-    $gfK = [math]::Round((GpuFreeMib ([int]$pk)) / 1024, 1)
-    if ($gfK -lt [double]$h.gpu.min_free_gib) {
-        Note ("   !! " + $pkName + " 空隙不够 (" + $gfK + "G < 门槛 " + $h.gpu.min_free_gib + "G), 服务会拒载不动主力 -- 两条路:")
-        Note "      ① 推荐时序: m>3 让 Strata 下场 -> 按 m>a -> 再回一级 [1] 拉 Strata (积木共存)"
-        Note "      ② 或把 TTS 门槛调低: ysk_serve_yosuko.bat 里 set YOSUKO_GPU_MIN_GIB=3 后重启 TTS (重启会让 CPU 端点重载约3分钟, 朗读短暂不可用)"
-        Note "=================== 未上岗, 回菜单 ==================="
-        return
+    if ($pk -eq '') {
+        # auto: hot-load on the server default card (precheck GPU0, where that default lives)
+        $gfK = [math]::Round((GpuFreeMib 0) / 1024, 1)
+        Note ("   门槛: 服务默认卡需 >= " + $h.gpu.min_free_gib + "G | GPU0 当前 " + $gfK + "G | gpu.state=" + $h.gpu.state)
+        if ($gfK -lt [double]$h.gpu.min_free_gib) {
+            Note "   !! 服务默认卡空隙不够, 服务按策略拒载 (不动主力) -- 两条路:"
+            Note "      ① 推荐时序: 装配自动清退 Strata / m>3 下场 -> 按 m>a -> 再拉 Strata (积木冷共存)"
+            Note "      ② 或把 TTS 门槛调低: serve_yosuko.bat 里 set YOSUKO_GPU_MIN_GIB=3 后重启 TTS (重启会让 CPU 端点重载约2分钟)"
+            Note "=================== 未上岗, 回菜单 ==================="
+            return
+        }
+    } else {
+        # specific card: gate the TARGET card, then cold restart 9210 under CVD single view
+        $gfi = [math]::Round((GpuFreeMib ([int]$pk)) / 1024, 1)
+        if ($gfi -lt [double]$h.gpu.min_free_gib) {
+            Note ("   !! " + $pkName + " 空闲 " + $gfi + "G < 门槛 " + $h.gpu.min_free_gib + "G -- 落不了座")
+            Note "      装配编排会自动清退占座的 Strata; 单按 m>a 时先 m>4 清 KVMem / 换卡再试"
+            Note "=================== 未上岗, 回菜单 ==================="
+            return
+        }
+        Note ("--- 单卡冷重启: YSK_GPU=" + $pk + " 锁 CUDA 视野, IndexTTS 全家只看见 " + $pkName + " (根治斩卡开; CPU 端点重载约2分钟, 期间朗读短暂不可用) ---")
+        KillGuard "ysk_serve_yosuko\.bat|ysk_task_yosuko\.vbs|ysk_run_hidden\.vbs.*yosuko"
+        TaskStop $TASK_TTS
+        KillService "缘狐声线 9210" 9210 | Out-Null
+        Start-Sleep -Seconds 3
+        $env:YSK_GPU = $pk
+        wscript //nologo $HID_VBS $TTS_BAT 2>&1 | Out-Null
+        Remove-Item Env:YSK_GPU -ErrorAction SilentlyContinue
+        Note "   等 9210 回来 (CPU 端点冷加载实测约132秒, 最多等 6 分钟)..."
+        $back = $false
+        for ($i = 0; $i -lt 72; $i++) { Start-Sleep -Seconds 5; $hb = TtsHealth; if ($hb -and $hb.cpu.state -eq 'ready') { $back = $true; break } }
+        if (-not $back) {
+            Note "   !! 6 分钟 9210 没回 -- 查 yosuko_server.log (serve bat 30s 自愈会继续尝试, 朗读稍后可能自愈)"
+            Note "=================== 冷重启未完成, 回菜单可重跑 ==================="
+            return
+        }
+        Note ("   9210 已回 (进程只看见 " + $pkName + ") -- POST /gpu/load")
     }
-    Note ("--- POST /gpu/load?device=" + $pk + " (fp32, 首次加载约1~3分钟) ---")
     $t0 = Get-Date
-    $r = Http "POST" ($T_URL + "/gpu/load?device=" + $pk) $null 240
+    $r = Http "POST" "$T_URL/gpu/load" $null 240   # no ?device: the CVD view (or server default) already fixes the card
+    $t0 = Get-Date
+    $r = Http "POST" "$T_URL/gpu/load" $null 240   # no ?device: the CVD view (or server default) already fixes the card
     Note ("   /gpu/load 返回 http=" + $r)
     $gon = $false; $h2 = $null
     for ($i = 0; $i -lt 40; $i++) {
@@ -1087,14 +1142,18 @@ function ArmTtsGpu([string]$Pick = 'auto') {
         if ($h2 -and $h2.gpu.state -eq 'ready') { $gon = $true; break }
     }
     if (-not $gon) {
-        $err = if ($h2) { $h2.gpu.error } else { 'health unreachable' }
-        Note ("   !! 3分钟未就绪 -- 查 E:\DSDeployMaster\ysk_autostart\yosuko_server.log (error=" + $err + ")")
+        $errT = if ($h2) { $h2.gpu.error } else { 'health unreachable' }
+        Note ("   !! 3分钟未就绪 -- 查 E:\DSDeployMaster\ysk_autostart\yosuko_server.log (error=" + $errT + ")")
         Note "=================== 上岗失败, 回菜单可重跑 ==================="
         return
     }
-    $devTxt = if ($null -ne $h2.gpu.device) { 'GPU' + $h2.gpu.device } else { 'GPU0 (在跑的服务版尚未上报卡信息 -- 9210 重启后选卡才真正生效, 本次固定 GPU0)' }
-    Note ("   GPU 端点就绪 OK, 实测等待 " + [math]::Round(((Get-Date) - $t0).TotalSeconds, 1) + "s, 实坐 " + $devTxt + "; device_policy=auto 之后合成自动走 GPU")
-    if ([double]$h2.gpu.idle_unload_sec -lt 86400) {
+    $seat2 = Gpu-Of-Pid (PortPid 9210)
+    if ($pk -ne '' -and $seat2 -ne ('gpu' + $pk)) {
+        Note ("⚠ 实坐较验: " + $(if ($seat2) { $seat2.ToUpper() } else { '未知' }) + " 没落在 " + $pkName + " -- 查 serve_yosuko.bat 的 YSK_GPU/CVD 段")
+    } else {
+        Note ("   就绪 OK, 实测等待 " + [math]::Round(((Get-Date) - $t0).TotalSeconds, 1) + "s, nvidia-smi 验证实坐 " + $(if ($seat2) { $seat2.ToUpper() } else { '待确认' }) + "; 合成自动走 GPU, 不再斩卡开")
+    }
+    if ($h2 -and [double]$h2.gpu.idle_unload_sec -lt 86400) {
         Note ("   提醒: 空闲 " + [int]([double]$h2.gpu.idle_unload_sec / 60) + " 分钟会自动卸回 CPU (env YOSUKO_GPU_IDLE_SECONDS) -- 要常驻改大该 env 后重启 TTS")
     }
     Note "--- 终态 ---"; GpuReport
@@ -1153,7 +1212,9 @@ function ArmTeleocrGpu([string]$Pick = 'auto') {
 function StanddownTeleocr {
     Note "=================== TeleOCR 18205 收回 (释放 GPU1) ==================="
     if (-not (PortPid 18205)) {
-        Note "   18205 本来就没在监听 -- 无事可做"
+        TaskStop $TASK_TL
+        KillGuard "ysk_serve_teleocr|ysk_task_teleocr|ysk_run_hidden\.vbs.*teleocr"
+        Note "   18205 没在监听 -- 顺手清循环宿主防复活 (它会等座自己拉 serve)"
         return
     }
     KillGuard "ysk_serve_teleocr|ysk_task_teleocr|ysk_run_hidden\.vbs.*teleocr"
@@ -1363,9 +1424,11 @@ function AssembleBlocks {
         CleanupStrata
     }
     # 1) tear down the unchecked ones (small first, engine-sized last)
+    # sweep unchecked blocks EVEN when their port is dark: the serve bats are watchdog LOOP
+    # HOSTS that happily wait out a full card and resurrect at the first free seat (261120
+    # 22:33 live fire: teleocr guard loop, task already disabled, woke 18205 mid-assembly).
     foreach ($id in $BLOCK_ORDER_DOWN) {
         if ($want[$id]) { continue }
-        if (-not (Block-Alive $id)) { continue }
         Unhook-Block $id
     }
     # 2) mount the checked ones in gate order; a live 9210 without its GPU endpoint gets the seat back
@@ -1382,7 +1445,8 @@ function AssembleBlocks {
             if ($id -eq 'tts') {
                 $h = TtsHealth
                 if ($h -and $h.gpu.state -eq 'ready') { Note "   缘狐声线 GPU 端点已在岗 -- 复用"; continue }
-                Note "   9210 已在岗但 GPU 端点未挂 -- 尝试上卡"; ArmTtsGpu; continue
+                $pkT = if ($picks.ContainsKey($id)) { $picks[$id] } else { 'auto' }
+                Note ("   9210 已在岗但 GPU 端点未挂 -- 尝试上卡 (pick=" + $pkT + ")"); ArmTtsGpu $pkT; continue
             }
             Note ("   " + $BLOCKS[$id].n + " 已在岗 -- 复用 (不重复点火)")
             continue

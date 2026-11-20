@@ -4,3 +4,5 @@ publish_win/
 _data/
 *.user
 *.vs/
+
+src/publish/
