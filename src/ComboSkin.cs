@@ -39,7 +39,8 @@ public static class ComboSkin
         if (_toggleTpl == null)
         {
             var tb = new FrameworkElementFactory(typeof(DockPanel));
-            var tbd = new FrameworkElementFactory(typeof(Border));
+            var tbd = new FrameworkElementFactory(typeof(Border), "tbd");
+            tbd.SetValue(FrameworkElement.NameProperty, "tbd");   // name BEFORE append or triggers miss it
             tbd.SetValue(Border.BackgroundProperty, Brushes.Transparent);
             tbd.SetValue(Border.BorderBrushProperty, Line);
             tbd.SetValue(Border.BorderThicknessProperty, new Thickness(1, 0, 0, 0));
@@ -55,8 +56,6 @@ public static class ComboSkin
             var over = new Trigger { Property = ToggleButton.IsCheckedProperty, Value = true };
             over.Setters.Add(new Setter(Border.BackgroundProperty, BtnBg, "tbd"));
             tt.Triggers.Add(over);
-            // name the border so the trigger can target it
-            tbd.SetValue(FrameworkElement.NameProperty, "tbd");
             tt.RegisterName("tbd", tbd);
             _toggleTpl = tt;
         }
