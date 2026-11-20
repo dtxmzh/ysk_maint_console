@@ -25,7 +25,7 @@ namespace MaintOps;
 /// pwsh -Run execution streamed back live.</summary>
 public sealed class MainWindow : Window
 {
-    internal const string Version = "1.1.1";
+    internal const string Version = "1.1.2";
 
     internal static SolidColorBrush F(Color c) { var b = new SolidColorBrush(c); b.Freeze(); return b; }
     internal static readonly Brush Bg    = F(Color.FromRgb(0x14, 0x18, 0x1D));
